@@ -1,0 +1,65 @@
+[en]
+BPS_STATS = must wait to use this command.
+BPS_STATS_PUG = There is no pug in progress!
+BPS_DISABLE = Command disabled
+BPS_STEAM_ONLY = Only for Steam accounts
+BPS_RESET_STATS = Your stats are to reset.!
+BPS_JOIN_CT = *Authorized Team Entry - CTs*
+BPS_JOIN_T = *Authorized Team Entry - Terroris*
+BPS_JOIN_S = *Unauthorized team access - SPECTADOR*
+BPS_REJOIN = *Stats is now active.*
+BPS_SET_ID_1 = *STATS Authorized!*
+BPS_DESACT_ID_15 = *STATS disabled ID=15*
+BPS_ACT_ID_1 = *STATS In Progress..*
+BPS_OFF_ID = *Statistics are disabled...*
+BPS_PLANT_C4 = *C4 in progress*
+BPS_PLANT_C4_MINI = *A minimum of 2 players is required.*
+BPS_EXPLO_C4 = *STATS, Explosion reported*
+BPS_EXPLO_C4_MINI = *A minimum of 2 players is required.*
+BPS_DEFUSE = *STATS, Defuser included*
+BPS_DATA_SAVE = *DATA SAVE successful*
+BPS_DESACT_DRAW = *DRAWN is not recorded.*
+
+[es]
+BPS_STATS = Debes esperar, para el uso de este comando.
+BPS_STATS_PUG = No hay ningún pug en progreso!
+BPS_DISABLE = Comando deshabilitado
+BPS_STEAM_ONLY = Solo para cuentas de Steam.!
+BPS_RESET_STATS = Tus estadísticas se a reiniciado.!
+BPS_JOIN_CT = *ENTRADA AL EQUIPO Authorized - CTs*
+BPS_JOIN_T = *ENTRADA AL EQUIPO Authorized - Terroris*
+BPS_JOIN_S = *ENTRADA AL EQUIPO NO Authorized - SPECTADOR*
+BPS_REJOIN = *Ya tienes el Stats Activo.*
+BPS_SET_ID_1 = *STATS Autorizado.!*
+BPS_DESACT_ID_15 = *STATS desactivado ID=15*
+BPS_ACT_ID_1 = *STATS en Progreso..*
+BPS_OFF_ID = *Estadistica Esta Desabilitado..*
+BPS_PLANT_C4 = *C4 en progreso*
+BPS_PLANT_C4_MINI = *Se necesita 2 jugadores Minimo*
+BPS_EXPLO_C4 = *STATS, Explosion contado*
+BPS_EXPLO_C4_MINI = *Se necesita 2 jugadores Minimo*
+BPS_DEFUSE = *STATS, Defuser contado*
+BPS_DATA_SAVE = *DATA SAVE successful*
+BPS_DESACT_DRAW = *DRAWN no se graba.*
+
+[bp]
+BPS_STATS = Você deve aguardar a utilização deste comando.
+BPS_STATS_PUG = Não há nenhuma pug em andamento!
+BPS_DISABLE = Comando desativado
+BPS_STEAM_ONLY = Somente para contas Steam
+BPS_RESET_STATS = Suas estatísticas são redefinir.!
+BPS_JOIN_CT = *Entrada de Equipe Autorizada - CTs*
+BPS_JOIN_T = *Entrada de Equipe Autorizada - Terroris*
+BPS_JOIN_S = *Acesso não autorizado da equipe - SPECTADOR*
+BPS_REJOIN = *As estatísticas estão ativas agora..*
+BPS_SET_ID_1 = *STATS Autorizado.!*
+BPS_DESACT_ID_15 = *STATS desativado ID=15*
+BPS_ACT_ID_1 = *STATS em andamento..*
+BPS_OFF_ID = *As estatísticas estão desativadas...*
+BPS_PLANT_C4 = *C4 em andamento*
+BPS_PLANT_C4_MINI = *É necessário um mínimo de 2 jogadores.*
+BPS_EXPLO_C4 = *STATS, Explosão relatada*
+BPS_EXPLO_C4_MINI = *É necessário um mínimo de 2 jogadores.*
+BPS_DEFUSE = *STATS, Desarmador incluído*
+BPS_DATA_SAVE = *DATA SAVE successful*
+BPS_DESACT_DRAW = *DRAWN não está registrado.*
