@@ -4,1577 +4,2885 @@
 #include < amxmisc >
 #include < cstrike >
 #include < csx >
-#include < engine >
 #include < fakemeta >
 #include < hamsandwich >
 #include < sqlx >
 #include < basicstatsconnect >
 
 #define PLUGIN "Basic Points Stats"
-#define VERSION "2.4.4"
-#define AUTHOR 	"Google Gemini, kwpd"
+#define VERSION "2.9.0"
+#define AUTHOR 	"kwpd & Gemini"
 
 #define ADMIN ADMIN_RCON
 #define MAXPLAYERS 32
-#define CONNECT_TASK1 1021
-#define CONNECT_TASK2 1022
+#if defined MAX_PLAYERS
+#undef MAX_PLAYERS
+#endif
+#define MAX_PLAYERS 33
 #define CONNECT_TASK3 1023
+#define DELAYED_LOAD_TASK 2048
+#define HEARTBEAT_TASK 4096
+#define BPS_MAX_NAME_LIMIT 12
+#define BPS_MAX_AUTH_RETRIES 15
+#define BPS_HEARTBEAT_INTERVAL 300.0
+#define BPS_PUG_FORW_LEN 37
 
-#define CheckUserIgnored(%1)	( g_bIgnored &   ( 1 << ( %1 & 31 ) ) )
+// Constantes nativas de estado/etapa PUG (deteccion automatica por xvars sin requerir pug_const.inc)
+#define BPS_PUG_STATUS_LIVE         0
+#define BPS_PUG_STATUS_WAITING      (1<<1)
+#define BPS_PUG_STAGE_FIRSTHALF     3
+#define BPS_PUG_STAGE_INTERMISSION  4
+#define BPS_PUG_STAGE_SECONDHALF    5
+#define BPS_PUG_STAGE_OVERTIME      6
+
 #define IsPlayer(%1)		( 1 <= %1 <= g_iMaxPlayers )
+
+enum _:eMainStats
+{
+	STAT_POINTS = 0,
+	STAT_LEVEL,
+	STAT_KILLS,
+	STAT_DEATHS,
+	STAT_ASSISTS,
+	STAT_BP,
+	STAT_BD,
+	STAT_ADR,
+	STAT_HSP,
+	STAT_RWS,
+	STAT_WIN,
+	STAT_LOS,
+	STAT_TIED,
+	STAT_RLOS,
+	STAT_RP
+}
+
+enum _:eWep1Stats
+{
+	W1_GLOCK18 = 0,
+	W1_USP,
+	W1_P228,
+	W1_DEAGLE,
+	W1_ELITE,
+	W1_FIVESEVEN,
+	W1_KNIFE,
+	W1_HEGRENADE,
+	W1_C4
+}
+
+enum _:eWep2Stats
+{
+	W2_M3 = 0,
+	W2_XM1014,
+	W2_TMP,
+	W2_UMP45,
+	W2_MAC10,
+	W2_MP5NAVY,
+	W2_P90,
+	W2_GALIL,
+	W2_FAMAS,
+	W2_AK47,
+	W2_M4A1,
+	W2_SCOUT,
+	W2_SG552,
+	W2_AWP,
+	W2_G3SG1,
+	W2_AUG,
+	W2_SG550,
+	W2_M249
+}
+
+enum _:eVersusStats
+{
+	VS_2K = 0,
+	VS_3K,
+	VS_4K,
+	VS_5K,
+	VS_V1,
+	VS_V2,
+	VS_V3,
+	VS_V4,
+	VS_V5
+}
 
 new g_iMaxPlayers
 new g_szAuthID[ MAX_PLAYERS ][ 35 ]
-new g_szName[ MAX_PLAYERS ][ 8 ]
+new g_szName[ MAX_PLAYERS ][ 64 ]
+new g_szSaveKey[ MAX_PLAYERS ][ 64 ]
+new bool:g_bUsingNameKey[ MAX_PLAYERS ]
+new bool:g_bLanBlocked[ MAX_PLAYERS ]
+new bool:g_bPlayedActiveMatch[ MAX_PLAYERS ]
+new g_iAuthRetries[ MAX_PLAYERS ]
+new g_iLoadSeq[ MAX_PLAYERS ]
+new Float:g_flLastStatsCmd[ MAX_PLAYERS ]
+new Float:g_flLastHeartbeat = 0.0
 new Handle:g_SqlTuple
+new bool:g_bDatabaseReady = false
+new bool:g_bValidTeams = false
+new bool:g_bRoundHadValidTeams = false
+new bool:g_bMapEnding = false
 
-new g_pcvarHost
-new g_pcvaruUser
-new g_pcvarPass 
-new g_pcvarDB 
+// MySQL Configuration, Tables & Multi-Server
+new g_szSqlHost[ 64 ]
+new g_szSqlUser[ 64 ]
+new g_szSqlPass[ 64 ]
+new g_szSqlDB[ 64 ]
+new SQL_TABLE1[ 64 ]
+new SQL_TABLE2[ 64 ]
+new SQL_TABLE3[ 64 ]
+new SQL_TABLE4[ 64 ]
 
-// new g_iCount
-// new g_iRank[ MAX_PLAYERS ]
+new g_szServerID[ 17 ]
+new g_szServerName[ 64 ]
+new g_szEffectiveServerID[ 17 ]
 
 new g_iCurrentKills[ MAX_PLAYERS ]
-new g_iCurrentKills_v[ MAX_PLAYERS ]
+new g_iBestLifeKills[ MAX_PLAYERS ]
+new g_iRoundMkTier[ MAX_PLAYERS ]
+new g_iRoundDmg[ MAX_PLAYERS ]
+new bool:g_bDiedInRound[ MAX_PLAYERS ]
+new bool:g_bUsedSecondLife[ MAX_PLAYERS ]
+new bool:g_bTeamHadTeammate[ 4 ]
 
-new g_bIgnored
+// Estadisticas actuales y snapshot sincronizado en BD (incrementos atomicos multi-server)
+new g_iStats[ MAX_PLAYERS ][ eMainStats ]
+new g_iStatsSynced[ MAX_PLAYERS ][ eMainStats ]
+new g_iWep1[ MAX_PLAYERS ][ eWep1Stats ]
+new g_iWep1Synced[ MAX_PLAYERS ][ eWep1Stats ]
+new g_iWep2[ MAX_PLAYERS ][ eWep2Stats ]
+new g_iWep2Synced[ MAX_PLAYERS ][ eWep2Stats ]
+new g_iVersus[ MAX_PLAYERS ][ eVersusStats ]
+new g_iVersusSynced[ MAX_PLAYERS ][ eVersusStats ]
 
-new g_szPoints[ MAX_PLAYERS ]
-new g_szLevels[ MAX_PLAYERS ]
-new g_szPoints_k[ MAX_PLAYERS ]
-new g_szPoints_d[ MAX_PLAYERS ]
-new g_szPoints_a[ MAX_PLAYERS ]
-new g_szPoints_bp[ MAX_PLAYERS ]
-new g_szPoints_bd[ MAX_PLAYERS ]
-new g_szPoints_adr[ MAX_PLAYERS ]
-new g_szPoints_hsp[ MAX_PLAYERS ]
-new g_szPoints_rws[ MAX_PLAYERS ]
-new g_szPoints_win[ MAX_PLAYERS ]
-new g_szPoints_los[ MAX_PLAYERS ]
-new g_szPoints_tied[ MAX_PLAYERS ]
-new g_szPoints_r_los[ MAX_PLAYERS ]
-new g_szPoints_rp[ MAX_PLAYERS ]
-
-// PISTOL
-new g_szCSW_GLOCK18[ MAX_PLAYERS ]
-new g_szCSW_USP[ MAX_PLAYERS ]
-new g_szCSW_P228[ MAX_PLAYERS ]
-new g_szCSW_DEAGLE[ MAX_PLAYERS ]
-new g_szCSW_ELITE[ MAX_PLAYERS ]
-new g_szCSW_FIVESEVEN[ MAX_PLAYERS ]
-new g_szCSW_KNIFE[ MAX_PLAYERS ]
-new g_szCSW_HEGRENADE[ MAX_PLAYERS ]
-new g_szCSW_C4[ MAX_PLAYERS ]
-
-// ARMAS
-new g_szCSW_M3[ MAX_PLAYERS ]
-new g_szCSW_XM1014[ MAX_PLAYERS ]
-new g_szCSW_TMP[ MAX_PLAYERS ]
-new g_szCSW_UMP45[ MAX_PLAYERS ]
-new g_szCSW_MAC10[ MAX_PLAYERS ]
-new g_szCSW_MP5NAVY[ MAX_PLAYERS ]
-new g_szCSW_P90[ MAX_PLAYERS ]
-new g_szCSW_GALIL[ MAX_PLAYERS ]
-new g_szCSW_FAMAS[ MAX_PLAYERS ]
-new g_szCSW_AK47[ MAX_PLAYERS ]
-new g_szCSW_M4A1[ MAX_PLAYERS ]
-new g_szCSW_SCOUT[ MAX_PLAYERS ]
-new g_szCSW_SG552[ MAX_PLAYERS ]
-new g_szCSW_AWP[ MAX_PLAYERS ]
-new g_szCSW_G3SG1[ MAX_PLAYERS ]
-new g_szCSW_AUG[ MAX_PLAYERS ]
-new g_szCSW_SG550[ MAX_PLAYERS ]
-new g_szCSW_M249[ MAX_PLAYERS ]
-
-// Versus
-new g_szPoints_2k[ MAX_PLAYERS ]
-new g_szPoints_3k[ MAX_PLAYERS ]
-new g_szPoints_4k[ MAX_PLAYERS ]
-new g_szPoints_5k[ MAX_PLAYERS ]
-new g_szPoints_v1[ MAX_PLAYERS ]
-new g_szPoints_v2[ MAX_PLAYERS ]
-new g_szPoints_v3[ MAX_PLAYERS ]
-new g_szPoints_v4[ MAX_PLAYERS ]
-new g_szPoints_v5[ MAX_PLAYERS ]
-
-// new bool:is_user_ignored[ MAX_PLAYERS ]
 new bool:g_bRoundEnded
+new bool:g_bRoundRestarting = false
+new bool:g_bPendingRestartReset = false
+new bool:g_bMultikillsAwarded = false
+new bool:g_bRoundWasLive = false
+new bool:g_bWasLiveTracking = false
+
+// Integracion automatica con PUG (compatible tambien con servidores sin PUG)
+new g_xvarPugStatus = -1
+new g_xvarPugStage = -1
+new bool:g_bPugDetected = false
+new bool:g_bPugForwardLive = false
+new bool:g_bPugMatchStartedLive = false
+new bool:g_bPugWinnerHandled = false
 
 new pcvarToggle1
 new pcvarToggle2
+new pcvarToggleBots
+new pcvarWebTop
+new pcvarSaveType
+new pcvarNameMaxLen
+new pcvarEnforceNameLen
+new pcvarServerID
+new pcvarServerName
+new pcvarMultiMode
+new pcvarPugSync
 
-new pug_dmg[MAX_PLAYERS + 1][MAX_PLAYERS + 1]
+new pug_dmg[ MAX_PLAYERS ][ MAX_PLAYERS ]
 new bps_players[ MAX_PLAYERS ]
-new bps_playersx[ MAX_PLAYERS ]
-new bps_players_round_save[ MAX_PLAYERS ]
 new bps_players_versus[ MAX_PLAYERS ]
-new pcvarToggle_stats
-// new bps_players_authorized[32]
+new g_iLoadedMask[ MAX_PLAYERS ]
+new bool:g_bLoadStarted[ MAX_PLAYERS ]
 
 public plugin_init()
 {
 	register_plugin( PLUGIN, VERSION, AUTHOR )
 	register_dictionary("BasicPointsStats.txt")
-	
-	g_pcvarHost = register_cvar( "bps_sql_host", "peak.evolution-host.com:3306", FCVAR_PROTECTED )
-	g_pcvaruUser = register_cvar( "bps_sql_user", "u451_I2EqpJTTR4", FCVAR_PROTECTED )
-	g_pcvarPass = register_cvar( "bps_sql_pass", "jDwx!V8OHzv@MWPV1Lts6.Pk", FCVAR_PROTECTED )
-	g_pcvarDB = register_cvar( "bps_sql_db", "s451_SkillPointsBeta", FCVAR_PROTECTED )
-	
-	register_cvar( "bps_sql_db_1", "basicpointsstats" )
-	register_cvar( "bps_sql_db_2", "basicweapomstats1" )
-	register_cvar( "bps_sql_db_3", "basicweapomstats2" )
-	register_cvar( "bps_sql_db_4", "basicversusstats" )
-	register_cvar( "bps_sql_temp_db", "skillpoints_pug1" )
-	register_cvar( "pug_web_top_pug", "http://186.66.21.118:8081/web/top15.php" )
-	register_cvar( "pug_web_temp_pug", "http://186.66.21.118:8081/WEB/" )
-	
+
+	pcvarWebTop = register_cvar( "pug_web_top_pug", "http://127.0.0.1/web/top15.php" )
+
 	register_clcmd("say", "stats_pug")
 	register_clcmd("say_team", "stats_pug")
-	
+
 	pcvarToggle1 = register_cvar("pug_leave_points", "0")
 	pcvarToggle2 = register_cvar("pug_stats_enable", "1")
-	
-	register_concmd("pug_end_stats", "motd_pug_end", ADMIN, "_")
+	pcvarToggleBots = register_cvar("pug_stats_bots", "0")
+	pcvarSaveType = register_cvar("bps_save_type", "1")
+	pcvarNameMaxLen = register_cvar("bps_name_max_len", "12")
+	pcvarEnforceNameLen = register_cvar("bps_enforce_name_len", "0")
+	pcvarServerID = register_cvar("bps_server_id", "srv1")
+	pcvarServerName = register_cvar("bps_server_name", "CS 1.6 Server #1")
+	pcvarMultiMode = register_cvar("bps_multi_server_mode", "0")
+	pcvarPugSync = register_cvar("bps_pug_sync", "2")
+
+	register_concmd("bps_end_stats", "motd_pug_end", ADMIN, "_")
 	register_concmd("bps_give_pugend", "points_all_pugend", ADMIN, "_")
 	register_concmd("amx_bps_ctwin", "points_win_ct", ADMIN, "_")
 	register_concmd("amx_bps_twin", "points_win_t", ADMIN, "_")
 	register_concmd("amx_bps_tie", "points_tied", ADMIN, "_")
-	
+
 	register_event( "SendAudio", "TerroristsWin", "a", "2&%!MRAD_terwin" )
+	register_event( "SendAudio", "TerroristsWin", "a", "2&%!MRAD_target" )
 	register_event( "SendAudio", "CounterTerroristsWin", "a", "2&%!MRAD_ctwin" )
+	register_event( "SendAudio", "CounterTerroristsWin", "a", "2&%!MRAD_bombdef" )
+	register_event( "SendAudio", "CounterTerroristsWin", "a", "2&%!MRAD_rescued" )
 	register_event( "SendAudio", "Event_RoundDraw", "a", "2&%!MRAD_rounddraw")
-	
-	//register_clcmd("joinclass","evento_joinclass","a")
+
+	register_logevent( "TerroristsWin", 3, "2=triggered", "3=Terrorists_Win" )
+	register_logevent( "TerroristsWin", 3, "2=triggered", "3=Target_Bombed" )
+	register_logevent( "CounterTerroristsWin", 3, "2=triggered", "3=CTs_Win" )
+	register_logevent( "CounterTerroristsWin", 3, "2=triggered", "3=Target_Saved" )
+	register_logevent( "CounterTerroristsWin", 3, "2=triggered", "3=Bomb_Defused" )
+	register_logevent( "CounterTerroristsWin", 3, "2=triggered", "3=All_Hostages_Rescued" )
+	register_logevent( "Event_RoundDraw", 2, "1=Round_Draw" )
+
 	register_event("TeamInfo", "join_team", "a")
-	// register_event("DeathMsg","cmd_death","ae")
 	register_event( "HLTV", "EventNewRound", "a", "1=0", "2=0" )
+	register_event( "30", "EventIntermission", "a" )
+	register_forward(FM_ChangeLevel, "FwdServerMapEnd")
+	register_forward(FM_ServerDeactivate, "FwdServerMapEnd")
+	register_logevent("EventRestartRound", 2, "1&Restart_Round_", "1=Game_Commencing")
+	register_logevent("EventFreezeTimeEnd", 2, "1=Round_Start")
 	register_logevent("EventRoundEnd", 2, "1=Round_End")
-	
-	
+
 	RegisterHam(Ham_TakeDamage, "player", "FwdPlayerDamagePost", 1)
 	RegisterHam(Ham_Killed, "player", "Ham_Killed_player")
 	RegisterHam(Ham_Spawn, "player", "FwdPlayerSpawnPost", 1)
-	
+
 	g_iMaxPlayers = get_maxplayers( )
-	
+
+	copy(SQL_TABLE1, charsmax(SQL_TABLE1), "basicpointsstats")
+	copy(SQL_TABLE2, charsmax(SQL_TABLE2), "basicweapomstats1")
+	copy(SQL_TABLE3, charsmax(SQL_TABLE3), "basicweapomstats2")
+	copy(SQL_TABLE4, charsmax(SQL_TABLE4), "basicversusstats")
+	copy(g_szServerID, charsmax(g_szServerID), "srv1")
+	copy(g_szServerName, charsmax(g_szServerName), "CS 1.6 Server #1")
+	copy(g_szEffectiveServerID, charsmax(g_szEffectiveServerID), "global")
+}
+
+public plugin_cfg()
+{
+	DetectPugSystem()
+
+	new szConfigsDir[128], szConfigFile[192]
+	get_configsdir(szConfigsDir, charsmax(szConfigsDir))
+	formatex(szConfigFile, charsmax(szConfigFile), "%s/BasicPointsStats.cfg", szConfigsDir)
+
+	if (!file_exists(szConfigFile))
+	{
+		new iFile = fopen(szConfigFile, "wt")
+		if (iFile)
+		{
+			fputs(iFile, "// ==============================================^n")
+			fputs(iFile, "// Basic Points Stats - Archivo de Configuracion Oficial^n")
+			fputs(iFile, "// ==============================================^n^n")
+			fputs(iFile, "bps_sql_host ^"127.0.0.1:3306^"^n")
+			fputs(iFile, "bps_sql_user ^"tu_usuario_db^"^n")
+			fputs(iFile, "bps_sql_pass ^"tu_contrasena_db^"^n")
+			fputs(iFile, "bps_sql_db ^"basicpointsstats^"^n^n")
+			fputs(iFile, "bps_sql_db_1 ^"basicpointsstats^"^n")
+			fputs(iFile, "bps_sql_db_2 ^"basicweapomstats1^"^n")
+			fputs(iFile, "bps_sql_db_3 ^"basicweapomstats2^"^n")
+			fputs(iFile, "bps_sql_db_4 ^"basicversusstats^"^n^n")
+			fputs(iFile, "// 0 = Desactivado | 1 = SteamID | 2 = Nombre (max 12 letras)^n")
+			fputs(iFile, "bps_save_type ^"1^"^n")
+			fputs(iFile, "bps_name_max_len ^"12^"^n")
+			fputs(iFile, "bps_enforce_name_len ^"0^"^n^n")
+			fputs(iFile, "// Multi-Server: 0 = Global Compartido | 1 = Separado por Servidor^n")
+			fputs(iFile, "bps_server_id ^"srv1^"^n")
+			fputs(iFile, "bps_server_name ^"CS 1.6 Server #1^"^n")
+			fputs(iFile, "bps_multi_server_mode ^"0^"^n^n")
+			fputs(iFile, "// PUG Sync: 2 = Auto (PUG Live si hay PUG / Normal si no hay PUG) | 1 = Solo PUG Live | 0 = Siempre activo^n")
+			fputs(iFile, "bps_pug_sync ^"2^"^n")
+			fputs(iFile, "pug_leave_points ^"0^"^n")
+			fputs(iFile, "pug_stats_enable ^"1^"^n")
+			fputs(iFile, "pug_stats_bots ^"0^"^n^n")
+			fputs(iFile, "pug_web_top_pug ^"http://127.0.0.1/web/top15.php^"^n")
+			fclose(iFile)
+		}
+		log_amx("%L", LANG_SERVER, "BPS_LOG_CFG_CREATED")
+		server_print("%L", LANG_SERVER, "BPS_LOG_CFG_CREATED")
+		g_bDatabaseReady = false
+		set_pcvar_num(pcvarToggle2, 0)
+		return
+	}
+
+	new iFile = fopen(szConfigFile, "rt")
+	if (!iFile)
+		return
+
+	new szLine[256], szKey[64], szVal[128]
+
+	while (!feof(iFile))
+	{
+		fgets(iFile, szLine, charsmax(szLine))
+		trim(szLine)
+
+		if (!szLine[0] || szLine[0] == ';' || szLine[0] == '#' || (szLine[0] == '/' && szLine[1] == '/'))
+			continue
+
+		szKey[0] = '^0'
+		szVal[0] = '^0'
+		parse(szLine, szKey, charsmax(szKey), szVal, charsmax(szVal))
+
+		if (equali(szKey, "bps_sql_host"))
+			copy(g_szSqlHost, charsmax(g_szSqlHost), szVal)
+		else if (equali(szKey, "bps_sql_user"))
+			copy(g_szSqlUser, charsmax(g_szSqlUser), szVal)
+		else if (equali(szKey, "bps_sql_pass"))
+			copy(g_szSqlPass, charsmax(g_szSqlPass), szVal)
+		else if (equali(szKey, "bps_sql_db"))
+			copy(g_szSqlDB, charsmax(g_szSqlDB), szVal)
+		else if (equali(szKey, "bps_sql_db_1") && IsValidSqlIdentifier(szVal))
+			copy(SQL_TABLE1, charsmax(SQL_TABLE1), szVal)
+		else if (equali(szKey, "bps_sql_db_2") && IsValidSqlIdentifier(szVal))
+			copy(SQL_TABLE2, charsmax(SQL_TABLE2), szVal)
+		else if (equali(szKey, "bps_sql_db_3") && IsValidSqlIdentifier(szVal))
+			copy(SQL_TABLE3, charsmax(SQL_TABLE3), szVal)
+		else if (equali(szKey, "bps_sql_db_4") && IsValidSqlIdentifier(szVal))
+			copy(SQL_TABLE4, charsmax(SQL_TABLE4), szVal)
+		else if (equali(szKey, "bps_save_type"))
+		{
+			if (equali(szVal, "off") || equali(szVal, "disabled") || equali(szVal, "desactivado") || equal(szVal, "0"))
+				set_pcvar_num(pcvarSaveType, 0)
+			else if (equali(szVal, "name") || equali(szVal, "nick") || equali(szVal, "nombre") || equal(szVal, "2"))
+				set_pcvar_num(pcvarSaveType, 2)
+			else
+				set_pcvar_num(pcvarSaveType, 1)
+		}
+		else if (equali(szKey, "bps_name_max_len"))
+		{
+			new iMaxLen = clamp(str_to_num(szVal), 1, BPS_MAX_NAME_LIMIT)
+			set_pcvar_num(pcvarNameMaxLen, iMaxLen)
+		}
+		else if (equali(szKey, "bps_enforce_name_len"))
+			set_pcvar_num(pcvarEnforceNameLen, str_to_num(szVal) ? 1 : 0)
+		else if (equali(szKey, "bps_server_id") && IsValidServerId(szVal))
+		{
+			copy(g_szServerID, charsmax(g_szServerID), szVal)
+			set_pcvar_string(pcvarServerID, g_szServerID)
+		}
+		else if (equali(szKey, "bps_server_name"))
+		{
+			copy(g_szServerName, charsmax(g_szServerName), szVal)
+			SanitizeSQLField(g_szServerName, charsmax(g_szServerName))
+			set_pcvar_string(pcvarServerName, g_szServerName)
+		}
+		else if (equali(szKey, "bps_multi_server_mode"))
+			set_pcvar_num(pcvarMultiMode, str_to_num(szVal) ? 1 : 0)
+		else if (equali(szKey, "bps_pug_sync"))
+		{
+			if (equali(szVal, "auto") || equal(szVal, "2"))
+				set_pcvar_num(pcvarPugSync, 2)
+			else
+				set_pcvar_num(pcvarPugSync, str_to_num(szVal) ? 1 : 0)
+		}
+		else if (equali(szKey, "pug_leave_points"))
+			set_pcvar_num(pcvarToggle1, str_to_num(szVal))
+		else if (equali(szKey, "pug_stats_enable"))
+			set_pcvar_num(pcvarToggle2, str_to_num(szVal))
+		else if (equali(szKey, "pug_stats_bots") || equali(szKey, "bps_stats_bots"))
+			set_pcvar_num(pcvarToggleBots, str_to_num(szVal))
+		else if (equali(szKey, "pug_web_top_pug"))
+			set_pcvar_string(pcvarWebTop, szVal)
+	}
+	fclose(iFile)
+
+	RefreshServerSettings()
+
+	new iSaveType = get_pcvar_num(pcvarSaveType)
+	if (iSaveType == 0)
+	{
+		g_bDatabaseReady = false
+		log_amx("%L", LANG_SERVER, "BPS_LOG_SAVE_DISABLED")
+		server_print("%L", LANG_SERVER, "BPS_LOG_SAVE_DISABLED")
+		return
+	}
+
+	if (!g_szSqlHost[0] || !g_szSqlUser[0] || !g_szSqlDB[0] || equal(g_szSqlUser, "tu_usuario_db") || equal(g_szSqlPass, "tu_contrasena_db"))
+	{
+		log_amx("%L", LANG_SERVER, "BPS_LOG_CREDS_MISSING")
+		server_print("%L", LANG_SERVER, "BPS_LOG_CREDS_MISSING")
+		g_bDatabaseReady = false
+		set_pcvar_num(pcvarToggle2, 0)
+		return
+	}
+
+	log_amx("%L", LANG_SERVER, "BPS_LOG_CREDS_LOADED")
+	server_print("%L", LANG_SERVER, "BPS_LOG_CREDS_LOADED")
+
+	new szModeLabel[40], szMultiLabel[40]
+	formatex(szModeLabel, charsmax(szModeLabel), "%L", LANG_SERVER, (iSaveType == 2) ? "BPS_MODE_NAME" : "BPS_MODE_STEAM")
+	formatex(szMultiLabel, charsmax(szMultiLabel), "%L", LANG_SERVER, (get_pcvar_num(pcvarMultiMode) == 1) ? "BPS_MULTI_DEDICATED" : "BPS_MULTI_GLOBAL")
+
+	log_amx("%L", LANG_SERVER, "BPS_LOG_SAVE_MODE", szModeLabel, GetEffectiveMaxNameLen(), g_szServerID, szMultiLabel)
+	server_print("%L", LANG_SERVER, "BPS_LOG_SAVE_MODE", szModeLabel, GetEffectiveMaxNameLen(), g_szServerID, szMultiLabel)
+
 	SqlInit()
+}
+
+stock RefreshServerSettings()
+{
+	new szCvarSrvId[17], szCvarSrvName[64]
+	get_pcvar_string(pcvarServerID, szCvarSrvId, charsmax(szCvarSrvId))
+	trim(szCvarSrvId)
+	if (IsValidServerId(szCvarSrvId))
+		copy(g_szServerID, charsmax(g_szServerID), szCvarSrvId)
+
+	get_pcvar_string(pcvarServerName, szCvarSrvName, charsmax(szCvarSrvName))
+	trim(szCvarSrvName)
+	if (szCvarSrvName[0])
+	{
+		SanitizeSQLField(szCvarSrvName, charsmax(szCvarSrvName))
+		copy(g_szServerName, charsmax(g_szServerName), szCvarSrvName)
+	}
+
+	if (get_pcvar_num(pcvarMultiMode) == 1)
+		copy(g_szEffectiveServerID, charsmax(g_szEffectiveServerID), g_szServerID)
+	else
+		copy(g_szEffectiveServerID, charsmax(g_szEffectiveServerID), "global")
+}
+
+stock SendServerHeartbeat()
+{
+	if (!g_SqlTuple || !g_bDatabaseReady)
+		return
+
+	RefreshServerSettings()
+	g_flLastHeartbeat = get_gametime()
+
+	static szSrvQuery[512]
+	formatex(szSrvQuery, charsmax(szSrvQuery),
+		"INSERT INTO bps_servers (server_id, server_name, save_mode, multi_mode) VALUES ('%s', '%s', %i, %i) \
+		ON DUPLICATE KEY UPDATE server_name = VALUES(server_name), save_mode = VALUES(save_mode), multi_mode = VALUES(multi_mode), last_heartbeat = CURRENT_TIMESTAMP",
+		g_szServerID, g_szServerName, get_pcvar_num(pcvarSaveType), get_pcvar_num(pcvarMultiMode))
+	SQL_ThreadQuery(g_SqlTuple, "IgnoreHandle", szSrvQuery)
+}
+
+public TaskServerHeartbeat()
+{
+	if (!g_bMapEnding)
+	{
+		SendServerHeartbeat()
+	}
+}
+
+public FwdServerMapEnd()
+{
+	g_bMapEnding = true
+	return FMRES_IGNORED
 }
 
 public SqlInit()
 {
-	new TEMP_SQL_TABLE[256]
-	get_cvar_string("bps_sql_temp_db",TEMP_SQL_TABLE,256)
-	
-	new szHost[ 32 ]
-	new szUser[ 32 ]
-	new szPass[ 32 ]
-	new szDB[ 32 ]
-	
-	get_pcvar_string( g_pcvarHost, szHost, charsmax( szHost ) )
-	get_pcvar_string( g_pcvaruUser, szUser, charsmax( szUser ) )
-	get_pcvar_string( g_pcvarPass, szPass, charsmax( szPass ) )
-	get_pcvar_string( g_pcvarDB, szDB, charsmax( szDB ) )
-	
-	g_SqlTuple = SQL_MakeDbTuple( szHost, szUser, szPass, szDB )
-	
-	new g_Error[ 512 ]
-	new ErrorCode
-	new Handle:SqlConnection = SQL_Connect( g_SqlTuple, ErrorCode, g_Error, charsmax( g_Error ))
-	
-	if( SqlConnection == Empty_Handle )
-	{
-		set_fail_state( g_Error )
-	}
-	new Handle:Queries
-	Queries = SQL_PrepareQuery( SqlConnection, "DROP TABLE IF EXISTS %s", TEMP_SQL_TABLE )
-	
-	if( !SQL_Execute( Queries ) )
-	{
-		SQL_QueryError(Queries, g_Error, charsmax(g_Error))
-		set_fail_state(g_Error)
-	}
-	
-	SQL_FreeHandle( Queries )
-	SQL_FreeHandle( SqlConnection )
+	g_SqlTuple = SQL_MakeDbTuple( g_szSqlHost, g_szSqlUser, g_szSqlPass, g_szSqlDB )
+
+	#if AMXX_VERSION_NUM >= 183
+	SQL_SetCharset( g_SqlTuple, "utf8mb4" )
+	#endif
+
+	static szTestQuery[512]
+	formatex( szTestQuery, charsmax( szTestQuery ),
+		"SELECT t1.id, t1.server_id, t1.save_key, t1.last_server, w1.server_id, w1.save_key, w2.server_id, w2.save_key, v.server_id, v.save_key, b.server_id FROM %s t1, %s w1, %s w2, %s v, bps_servers b WHERE 1=0",
+		SQL_TABLE1, SQL_TABLE2, SQL_TABLE3, SQL_TABLE4 )
+	SQL_ThreadQuery( g_SqlTuple, "CheckDatabaseConnection", szTestQuery )
+
 	return PLUGIN_CONTINUE
+}
+
+public CheckDatabaseConnection( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
+{
+	if (FailState == TQUERY_CONNECT_FAILED)
+	{
+		g_bDatabaseReady = false
+		set_pcvar_num(pcvarToggle2, 0)
+		log_amx("%L (MySQL: %s)", LANG_SERVER, "BPS_LOG_DB_NOT_FOUND", Error)
+		server_print("%L (MySQL: %s)", LANG_SERVER, "BPS_LOG_DB_NOT_FOUND", Error)
+		return
+	}
+
+	if (FailState == TQUERY_QUERY_FAILED || Errcode)
+	{
+		g_bDatabaseReady = false
+		set_pcvar_num(pcvarToggle2, 0)
+		log_amx("%L (MySQL: %s)", LANG_SERVER, "BPS_LOG_TABLE_NOT_FOUND", Error)
+		server_print("%L (MySQL: %s)", LANG_SERVER, "BPS_LOG_TABLE_NOT_FOUND", Error)
+		return
+	}
+
+	g_bDatabaseReady = true
+	log_amx("%L", LANG_SERVER, "BPS_LOG_DB_CONNECTED")
+	server_print("%L", LANG_SERVER, "BPS_LOG_DB_CONNECTED")
+
+	SendServerHeartbeat()
+	remove_task(HEARTBEAT_TASK)
+	set_task(BPS_HEARTBEAT_INTERVAL, "TaskServerHeartbeat", HEARTBEAT_TASK, _, _, "b")
+	UpdateValidTeams()
+
+	new Players[MAXPLAYERS], iNum
+	get_players(Players, iNum, "ch")
+	for (new i = 0; i < iNum; i++)
+	{
+		new id = Players[i]
+		if (!g_bLoadStarted[id])
+		{
+			TryStartLoad(id)
+		}
+	}
+}
+
+public EventIntermission()
+{
+	g_bMapEnding = true
+
+	if (!IsStatsActive() || !g_SqlTuple)
+		return
+
+	new Players[MAXPLAYERS], iNum
+	get_players(Players, iNum, "ch")
+	for (new i = 0; i < iNum; i++)
+	{
+		FlushPlayerStats(Players[i], true)
+	}
 }
 
 public plugin_end()
 {
-	SQL_FreeHandle( g_SqlTuple )
+	g_bMapEnding = true
+	remove_task(HEARTBEAT_TASK)
+
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		remove_task(CONNECT_TASK3 + i)
+		remove_task(DELAYED_LOAD_TASK + i)
+
+		if (is_user_connected(i) && !is_user_bot(i) && !is_user_hltv(i))
+		{
+			FlushPlayerStats(i, false)
+		}
+	}
+
+	if (g_SqlTuple)
+	{
+		SQL_FreeHandle( g_SqlTuple )
+		g_SqlTuple = Empty_Handle
+	}
 }
 
 public client_authorized( id )
 {
-	get_user_authid( id , g_szAuthID[id], charsmax( g_szAuthID[ ] ) )
-	get_user_info( id, "name", g_szName[id], charsmax( g_szName[ ] ) )
-	
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "'", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "^"", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "`", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "´", "*" )
+	if (is_user_bot(id) || is_user_hltv(id))
+		return
+
+	get_user_authid( id, g_szAuthID[id], charsmax( g_szAuthID[] ) )
+	SanitizeSQLField( g_szAuthID[ id ], charsmax( g_szAuthID[] ) )
+	g_bLanBlocked[id] = false
+
+	if (is_user_connected(id) && IsStatsActive() && g_SqlTuple && !g_bLoadStarted[id])
+	{
+		TryStartLoad(id)
+	}
 }
+
 public client_connect(id)
 {
-	if(is_user_bot(id) || is_user_hltv(id))
-	{
-		return PLUGIN_HANDLED;
-		} else {
-		bps_players[id] = 15
-		bps_playersx[id] = 15
-		bps_players_round_save[id] = 10
-		// server_cmd("say Jugador conectandose")
+	if (is_user_bot(id) || is_user_hltv(id))
 		return PLUGIN_CONTINUE
-	}
+
+	ResetPlayerData(id)
+	return PLUGIN_CONTINUE
 }
 
 public client_putinserver( id )
 {
-	if(is_user_bot(id) || is_user_hltv(id))
-	{
-		return PLUGIN_HANDLED;
-		} else {
-		bps_players[id] = 15
-		bps_playersx[id] = 15
-		bps_players_round_save[id] = 10
-		bps_players_versus[id] = 0
-		g_iCurrentKills[id] = 0
-		g_iCurrentKills_v[id] = 0
-		// server_cmd("say JUGADOR CONECTADO")
+	if (is_user_bot(id) || is_user_hltv(id))
 		return PLUGIN_CONTINUE
-	}
-}
 
-public join_team(id)
-{
-	new id = read_data(1)
-	static user_team[32]
-	read_data(2, user_team, 31)
-	
-	if(!is_user_connected(id))
-		return PLUGIN_CONTINUE
-	
-	switch(user_team[0])
+	UpdateValidTeams()
+
+	if (IsStatsActive() && g_SqlTuple && !g_bLoadStarted[id])
 	{
-		case 'T': 
-		{
-			if(bps_playersx[id] == 15) {
-				bps_playersx[id] = 1
-				set_task( 0.5, "Test_client_authorized", id + CONNECT_TASK2 )
-				// client_print(id, print_chat, "BPS - *ENTRADA AL EQUIPO Authorized Terroris* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_JOIN_T")
-			}
-			return PLUGIN_CONTINUE
-		}
-		case 'C':
-		{
-			if(bps_playersx[id] == 15) {
-				bps_playersx[id] = 1
-				set_task( 0.5, "Test_client_authorized", id + CONNECT_TASK2 )
-				// client_print(id, print_chat, "BPS - *ENTRADA AL EQUIPO Authorized CTs* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_JOIN_CT")
-			}
-			return PLUGIN_CONTINUE
-		}
-		case 'S':
-		{
-			if(bps_playersx[id] == 15) {
-				bps_playersx[id] = 15
-				// client_print(id, print_chat, "BPS - *ENTRADA AL EQUIPO NO Authorized SPECTADOR* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_JOIN_S")
-			}
-			return PLUGIN_CONTINUE
-		}
+		TryStartLoad(id)
 	}
-	if(bps_players[id] == 1)
+
+	if (!g_bLoadStarted[id] && !g_bLanBlocked[id] && get_pcvar_num(pcvarSaveType) != 0)
 	{
-		// client_print(id, print_chat, "BPS - *ENTRADA AL EQUIPO Autirized* PASSE.!")
-		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_REJOIN")
-		return PLUGIN_CONTINUE
+		remove_task(DELAYED_LOAD_TASK + id)
+		set_task(1.5, "TaskDelayedLoad", DELAYED_LOAD_TASK + id)
 	}
+
 	return PLUGIN_CONTINUE
 }
 
-public Test_client_authorized(id)
+public TaskDelayedLoad(taskid)
 {
-	id -= CONNECT_TASK2
-	
-	LoadPoints1(id)
-	LoadPoints2(id)
-	LoadPoints3(id)
-	LoadPoints4(id)
-}
+	new id = taskid - DELAYED_LOAD_TASK
+	if (!is_user_connected(id) || is_user_bot(id) || is_user_hltv(id) || g_bLoadStarted[id] || g_bLanBlocked[id])
+		return
 
-public Test_bps_players(id)
-{
-	bps_players[id] = 1
-	// client_print( id, print_chat, "BPS - *SET Players ID = 1* PASSE.!")
-	client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_SET_ID_1")
-	return PLUGIN_CONTINUE
-}
-
-public client_infochanged( id )
-{
-	if( is_user_connected(id) || !task_exists( id + CONNECT_TASK1 ) || !task_exists( id + CONNECT_TASK2 ) )
+	if (IsStatsActive() && g_SqlTuple)
 	{
-		new szNewName[ 32 ]
-		get_user_info( id, "name", szNewName, charsmax( szNewName ) ) 
-		new iLen = strlen( szNewName )
-		new iPos = iLen - 1
-		if( szNewName[ iPos ] == '>' )
+		TryStartLoad(id)
+	}
+
+	if (!g_bLoadStarted[id] && !g_bLanBlocked[id] && g_iAuthRetries[id] < BPS_MAX_AUTH_RETRIES && get_pcvar_num(pcvarSaveType) != 0)
+	{
+		g_iAuthRetries[id]++
+		set_task(2.0, "TaskDelayedLoad", DELAYED_LOAD_TASK + id)
+	}
+}
+
+public TryStartLoad(id)
+{
+	if (!is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	if (!IsStatsActive() || !g_SqlTuple || g_bLoadStarted[id] || g_iLoadedMask[id] == 15)
+		return
+
+	RefreshServerSettings()
+
+	if (!ResolvePlayerIdentity(id))
+		return
+
+	remove_task(DELAYED_LOAD_TASK + id)
+	g_iLoadSeq[id]++
+	g_bLoadStarted[id] = true
+	if (!(g_iLoadedMask[id] & (1 << 0))) LoadPoints1(id)
+	if (!(g_iLoadedMask[id] & (1 << 1))) LoadPoints2(id)
+	if (!(g_iLoadedMask[id] & (1 << 2))) LoadPoints3(id)
+	if (!(g_iLoadedMask[id] & (1 << 3))) LoadPoints4(id)
+}
+
+stock ScheduleLoadRetry(id)
+{
+	g_bLoadStarted[id] = false
+	if (is_user_connected(id) && !is_user_bot(id) && !is_user_hltv(id) && !g_bLanBlocked[id] && g_iLoadedMask[id] != 15 && g_iAuthRetries[id] < BPS_MAX_AUTH_RETRIES && get_pcvar_num(pcvarSaveType) != 0)
+	{
+		g_iAuthRetries[id]++
+		remove_task(DELAYED_LOAD_TASK + id)
+		set_task(2.5, "TaskDelayedLoad", DELAYED_LOAD_TASK + id)
+	}
+}
+
+public client_infochanged(id)
+{
+	if (!is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	static szRawNewName[64], szTruncNewName[64], szSanitizedNewName[64]
+	get_user_info(id, "name", szRawNewName, charsmax(szRawNewName))
+
+	copy(szTruncNewName, charsmax(szTruncNewName), szRawNewName)
+	TruncatePlayerName(szTruncNewName, charsmax(szTruncNewName), GetEffectiveMaxNameLen())
+
+	if (get_pcvar_num(pcvarEnforceNameLen) && !equal(szRawNewName, szTruncNewName) && szTruncNewName[0])
+	{
+		set_user_info(id, "name", szTruncNewName)
+	}
+
+	copy(szSanitizedNewName, charsmax(szSanitizedNewName), szTruncNewName)
+	SanitizeSQLField(szSanitizedNewName, charsmax(szSanitizedNewName))
+
+	if (!szSanitizedNewName[0])
+		return
+
+	if (!equal(g_szName[id], szSanitizedNewName))
+	{
+		if (g_bUsingNameKey[id])
 		{
-			new i
-			for( i = 1; i < 7; i++ )
+			// Guardar estadisticas acumuladas bajo el nombre anterior incluso si paso a espectador
+			FlushPlayerStats(id, true)
+
+			copy(g_szName[id], charsmax(g_szName[]), szSanitizedNewName)
+			formatex(g_szSaveKey[id], charsmax(g_szSaveKey[]), "N:%s", g_szName[id])
+			SanitizeSQLField(g_szSaveKey[id], charsmax(g_szSaveKey[]))
+
+			ResetPlayerStatsOnly(id)
+			bps_players[id] = 15
+			g_iLoadedMask[id] = 0
+			g_iAuthRetries[id] = 0
+			g_bLoadStarted[id] = false
+
+			if (IsStatsActive() && g_SqlTuple)
 			{
-				if( szNewName[ iPos - i ] == '<' )
-				{
-					iLen = iPos - i
-					szNewName[ iLen ] = EOS
-					break
-				}
+				g_iLoadSeq[id]++
+				g_bLoadStarted[id] = true
+				LoadPoints1(id)
+				LoadPoints2(id)
+				LoadPoints3(id)
+				LoadPoints4(id)
 			}
 		}
-		trim( szNewName )
-		if( !equal( g_szName[ id ], szNewName ) )
+		else
 		{
-			copy( g_szName[ id ], charsmax( g_szName[ ] ), szNewName )
-			
-			replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "'", "*" )
-			replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "^"", "*" )
-			replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "`", "*" )
-			replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "´", "*" )
+			copy(g_szName[id], charsmax(g_szName[]), szSanitizedNewName)
 		}
 	}
-	return PLUGIN_CONTINUE
+}
+
+stock CsTeams:SafeGetUserTeam(id)
+{
+	if (!IsPlayer(id) || !is_user_connected(id) || is_user_hltv(id) || pev_valid(id) != 2)
+		return CS_TEAM_UNASSIGNED
+
+	return cs_get_user_team(id)
 }
 
 public client_disconnected(id)
 {
-	if(bps_players[id] == 1)
+	remove_task(CONNECT_TASK3 + id)
+	remove_task(DELAYED_LOAD_TASK + id)
+
+	if (is_user_bot(id) || is_user_hltv(id))
 	{
-		remove_task( id )
-		remove_task( id + CONNECT_TASK1 )
-		remove_task( id + CONNECT_TASK2 )
-		remove_task( id + CONNECT_TASK3 )
-		bps_players_versus[id] = 0
-		g_szPoints[ id ] -= get_pcvar_num(pcvarToggle1)
-		CheckLevelAndSave1(id)
-		CheckLevelAndSave2(id)
-		CheckLevelAndSave3(id)
-		CheckLevelAndSave4(id)
-		// server_cmd("say Se Grabo al salir")
+		ResetPlayerData(id)
+		UpdateValidTeams()
+		if (!g_bMapEnding && !g_bRoundEnded && !g_bRoundRestarting && CheckMatchLiveState() && g_bValidTeams)
+		{
+			CheckTeamClutch(CS_TEAM_T, id)
+			CheckTeamClutch(CS_TEAM_CT, id)
+		}
+		return
+	}
+
+	if (IsStatsActive() && g_iLoadedMask[id] != 0)
+	{
+		new bool:bApplyLeavePenalty = (!g_bMapEnding && get_pcvar_num(pcvarToggle1) && g_bPlayedActiveMatch[id] && (g_iLoadedMask[id] & (1 << 0)))
+		if (bApplyLeavePenalty && IsPugModeEnabled() && !IsPugMatchInProgress())
+		{
+			bApplyLeavePenalty = false
+		}
+
+		if (bApplyLeavePenalty)
+		{
+			g_iStats[id][STAT_POINTS] = (g_iStats[id][STAT_POINTS] >= 10) ? (g_iStats[id][STAT_POINTS] - 10) : 0
+			g_iStats[id][STAT_LOS]++
+		}
+
+		FlushPlayerStats(id, false)
+	}
+
+	ResetPlayerData(id)
+	UpdateValidTeams()
+
+	if (!g_bMapEnding && !g_bRoundEnded && !g_bRoundRestarting && CheckMatchLiveState() && g_bValidTeams)
+	{
+		CheckTeamClutch(CS_TEAM_T, id)
+		CheckTeamClutch(CS_TEAM_CT, id)
+	}
+}
+
+stock bool:FlushPlayerStats(id, bool:bRequireConnected = true)
+{
+	if (!IsStatsActive() || !g_SqlTuple || g_iLoadedMask[id] == 0)
+		return false
+
+	new bool:bSaved = false
+	if (CheckLevelAndSave1(id, bRequireConnected)) bSaved = true
+	if (CheckLevelAndSave2(id, bRequireConnected)) bSaved = true
+	if (CheckLevelAndSave3(id, bRequireConnected)) bSaved = true
+	if (CheckLevelAndSave4(id, bRequireConnected)) bSaved = true
+	return bSaved
+}
+
+stock ResetPlayerData(id)
+{
+	bps_players[id] = 15
+	bps_players_versus[id] = 0
+	g_iLoadedMask[id] = 0
+	g_bLoadStarted[id] = false
+	g_bUsingNameKey[id] = false
+	g_bLanBlocked[id] = false
+	g_bPlayedActiveMatch[id] = false
+	g_iAuthRetries[id] = 0
+	g_iLoadSeq[id]++
+	g_flLastStatsCmd[id] = 0.0
+	g_szAuthID[id][0] = '^0'
+	g_szName[id][0] = '^0'
+	g_szSaveKey[id][0] = '^0'
+
+	ResetPlayerStatsOnly(id)
+}
+
+stock ResetPlayerStatsOnly(id)
+{
+	bps_players_versus[id] = 0
+	g_iCurrentKills[id] = 0
+	g_iBestLifeKills[id] = 0
+	g_iRoundMkTier[id] = 0
+	g_iRoundDmg[id] = 0
+	g_bDiedInRound[id] = false
+	g_bUsedSecondLife[id] = false
+
+	arrayset(g_iStats[id], 0, eMainStats)
+	arrayset(g_iStatsSynced[id], 0, eMainStats)
+	arrayset(g_iWep1[id], 0, eWep1Stats)
+	arrayset(g_iWep1Synced[id], 0, eWep1Stats)
+	arrayset(g_iWep2[id], 0, eWep2Stats)
+	arrayset(g_iWep2Synced[id], 0, eWep2Stats)
+	arrayset(g_iVersus[id], 0, eVersusStats)
+	arrayset(g_iVersusSynced[id], 0, eVersusStats)
+
+	for (new i = 0; i < MAX_PLAYERS; i++)
+	{
+		pug_dmg[id][i] = 0
+		pug_dmg[i][id] = 0
+	}
+}
+
+public join_team()
+{
+	new id = read_data(1)
+	static user_team[32]
+	read_data(2, user_team, charsmax(user_team))
+
+	if (!is_user_connected(id))
 		return PLUGIN_CONTINUE
-		} else {
-		remove_task( id )
-		remove_task( id + CONNECT_TASK1 )
-		remove_task( id + CONNECT_TASK2 )
-		remove_task( id + CONNECT_TASK3 )
-		// server_cmd("say Se removio los TASK ID")
+
+	if (is_user_bot(id))
+	{
+		if (user_team[0] == 'T' || user_team[0] == 'C')
+			bps_players[id] = 1
+		else
+			bps_players[id] = 15
+		UpdateValidTeams()
 		return PLUGIN_CONTINUE
+	}
+
+	if (!IsStatsActive())
+	{
+		bps_players[id] = 15
+		UpdateValidTeams()
+		return PLUGIN_CONTINUE
+	}
+
+	if (!IsMatchTrackingActive())
+	{
+		if (user_team[0] == 'S' || user_team[0] == 'U')
+		{
+			FlushPlayerStats(id, true)
+		}
+		bps_players[id] = 15
+		UpdateValidTeams()
+		return PLUGIN_CONTINUE
+	}
+
+	switch (user_team[0])
+	{
+		case 'T':
+		{
+			if (g_bLanBlocked[id])
+			{
+				bps_players[id] = 15
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_STEAM_ONLY")
+			}
+			else if (g_iLoadedMask[id] == 15 && bps_players[id] == 15)
+			{
+				bps_players[id] = 1
+				g_bPlayedActiveMatch[id] = true
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_JOIN_T")
+			}
+			else if (g_iLoadedMask[id] != 15)
+			{
+				bps_players[id] = 15
+				if (!g_bLoadStarted[id])
+					TryStartLoad(id)
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_AUTH_PENDING")
+			}
+		}
+		case 'C':
+		{
+			if (g_bLanBlocked[id])
+			{
+				bps_players[id] = 15
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_STEAM_ONLY")
+			}
+			else if (g_iLoadedMask[id] == 15 && bps_players[id] == 15)
+			{
+				bps_players[id] = 1
+				g_bPlayedActiveMatch[id] = true
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_JOIN_CT")
+			}
+			else if (g_iLoadedMask[id] != 15)
+			{
+				bps_players[id] = 15
+				if (!g_bLoadStarted[id])
+					TryStartLoad(id)
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_AUTH_PENDING")
+			}
+		}
+		case 'S', 'U':
+		{
+			bps_players_versus[id] = 0
+			FlushPlayerStats(id, true)
+			if (bps_players[id] != 15)
+			{
+				bps_players[id] = 15
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_JOIN_S")
+			}
+		}
+	}
+
+	UpdateValidTeams()
+
+	if (!g_bRoundEnded && !g_bRoundRestarting && CheckMatchLiveState() && g_bValidTeams && (user_team[0] == 'S' || user_team[0] == 'U'))
+	{
+		CheckTeamClutch(CS_TEAM_T, id)
+		CheckTeamClutch(CS_TEAM_CT, id)
+	}
+
+	return PLUGIN_CONTINUE
+}
+
+stock CheckTeamClutch(CsTeams:iTeam, excludeVictim = 0)
+{
+	if (g_bRoundEnded || g_bRoundRestarting || (iTeam != CS_TEAM_T && iTeam != CS_TEAM_CT))
+		return
+
+	new bool:bCountBots = ShouldCountBotsInMatch()
+	new CsTeams:iEnemyTeam = (iTeam == CS_TEAM_T) ? CS_TEAM_CT : CS_TEAM_T
+
+	new iAliveTeam = 0
+	new iLonePlayer = 0
+	new iAliveEnemies = 0
+
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		if (i == excludeVictim || !is_user_connected(i) || is_user_hltv(i) || !is_user_alive(i))
+			continue
+
+		new CsTeams:pTeam = SafeGetUserTeam(i)
+		if (pTeam == iTeam)
+		{
+			iAliveTeam++
+			iLonePlayer = i
+		}
+		else if (pTeam == iEnemyTeam)
+		{
+			if (bCountBots || !is_user_bot(i))
+				iAliveEnemies++
+		}
+	}
+
+	if (iAliveTeam >= 2)
+	{
+		g_bTeamHadTeammate[_:iTeam] = true
+		for (new i = 1; i <= g_iMaxPlayers; i++)
+		{
+			if (is_user_connected(i) && SafeGetUserTeam(i) == iTeam)
+				bps_players_versus[i] = 0
+		}
+		return
+	}
+
+	if (iAliveTeam == 1 && g_bTeamHadTeammate[_:iTeam])
+	{
+		if (!is_user_bot(iLonePlayer) && bps_players[iLonePlayer] == 1 && !g_bUsedSecondLife[iLonePlayer] && bps_players_versus[iLonePlayer] == 0)
+		{
+			if (iAliveEnemies >= 1)
+			{
+				bps_players_versus[iLonePlayer] = iAliveEnemies
+			}
+		}
 	}
 }
 
 public client_death(killer, victim, wpnindex, hitplace, TK)
 {
-	// Validaciones iniciales (Guard Clauses) para evitar errores, autolesiones y Team Kills
-	if (!IsPlayer(killer) || !IsPlayer(victim) || killer == victim || TK)
+	if (g_bRoundRestarting || !CheckMatchLiveState() || !g_bValidTeams || TK)
+		return PLUGIN_CONTINUE
+
+	new bool:bCountBots = ShouldCountBotsInMatch()
+	new CsTeams:kTeam = IsPlayer(killer) ? SafeGetUserTeam(killer) : CS_TEAM_UNASSIGNED
+	new CsTeams:vTeam = IsPlayer(victim) ? SafeGetUserTeam(victim) : CS_TEAM_UNASSIGNED
+
+	if (IsPlayer(killer) && IsPlayer(victim) && killer != victim && is_user_connected(killer) && !is_user_bot(killer) && bps_players[killer] == 1)
 	{
-		return PLUGIN_CONTINUE;
-	}
-	
-	// Verificamos si el sistema de puntos general está activo y si el killer no está ignorado
-	if (bps_players[killer] == 1 && get_pcvar_num(pcvarToggle2) && !CheckUserIgnored(killer))
-	{
-		// Estadísticas básicas generales de bajas
-		g_iCurrentKills[killer]++;
-		g_szPoints_k[killer]++;
-		
-		// --- 1. REGISTRO DE ESTADÍSTICAS POR ARMA (WPNINDEX) ---
-		switch (wpnindex)
+		if ((bCountBots || !is_user_bot(victim)) && (kTeam == CS_TEAM_T || kTeam == CS_TEAM_CT) && (vTeam == CS_TEAM_T || vTeam == CS_TEAM_CT) && kTeam != vTeam)
 		{
-			// Pistolas y equipamiento menor
-			case CSW_GLOCK18:   { g_szCSW_GLOCK18[killer]++; }
-			case CSW_USP:       { g_szCSW_USP[killer]++; }
-			case CSW_P228:      { g_szCSW_P228[killer]++; }
-			case CSW_DEAGLE:    { g_szCSW_DEAGLE[killer]++; }
-			case CSW_ELITE:     { g_szCSW_ELITE[killer]++; }
-			case CSW_FIVESEVEN:{ g_szCSW_FIVESEVEN[killer]++; }
-			case CSW_KNIFE:     { g_szCSW_KNIFE[killer]++; }
-			case CSW_HEGRENADE:{ g_szCSW_HEGRENADE[killer]++; }
-			case CSW_C4:        { g_szCSW_C4[killer]++; }
-			
-			// Escopetas y Subfusiles (SMGs)
-			case CSW_M3:        { g_szCSW_M3[killer]++; }
-			case CSW_XM1014:    { g_szCSW_XM1014[killer]++; }
-			case CSW_TMP:       { g_szCSW_TMP[killer]++; }
-			case CSW_UMP45:     { g_szCSW_UMP45[killer]++; }
-			case CSW_MAC10:     { g_szCSW_MAC10[killer]++; }
-			case CSW_MP5NAVY:   { g_szCSW_MP5NAVY[killer]++; }
-			case CSW_P90:       { g_szCSW_P90[killer]++; }
-			
-			// Rifles de asalto y francotiradores
-			case CSW_GALIL:     { g_szCSW_GALIL[killer]++; }
-			case CSW_FAMAS:     { g_szCSW_FAMAS[killer]++; }
-			case CSW_AK47:      { g_szCSW_AK47[killer]++; }
-			case CSW_M4A1:      { g_szCSW_M4A1[killer]++; }
-			case CSW_SCOUT:     { g_szCSW_SCOUT[killer]++; }
-			case CSW_SG552:     { g_szCSW_SG552[killer]++; }
-			case CSW_AWP:       { g_szCSW_AWP[killer]++; }
-			case CSW_G3SG1:     { g_szCSW_G3SG1[killer]++; }
-			case CSW_AUG:       { g_szCSW_AUG[killer]++; }
-			case CSW_SG550:     { g_szCSW_SG550[killer]++; }
-			case CSW_M249:      { g_szCSW_M249[killer]++; }
-		}
-		
-		// --- 3. LÓGICA DE VERSUS (CLUTCH) ---
-		new iKillerTeam = _:cs_get_user_team(killer);
-		
-		if (iKillerTeam == _:CS_TEAM_T || iKillerTeam == _:CS_TEAM_CT)
-		{
-			new enemies[32], num_enemies;
-			get_players(enemies, num_enemies, "ae", (iKillerTeam == _:CS_TEAM_T) ? "CT" : "TERRORIST");
-			
-			new teammates[32], num_teammates;
-			get_players(teammates, num_teammates, "ae", (iKillerTeam == _:CS_TEAM_T) ? "TERRORIST" : "CT");
-			
-			// Si el número de compañeros vivos es 1 (el propio asesino)
-			if (num_teammates <= 1)
+			g_iCurrentKills[killer]++
+			if (g_iCurrentKills[killer] > g_iBestLifeKills[killer])
 			{
-				switch (num_enemies)
+				g_iBestLifeKills[killer] = g_iCurrentKills[killer]
+			}
+
+			g_iStats[killer][STAT_KILLS]++
+			g_iStats[killer][STAT_POINTS] += 1
+
+			switch (wpnindex)
+			{
+				case CSW_GLOCK18:   { g_iWep1[killer][W1_GLOCK18]++; }
+				case CSW_USP:       { g_iWep1[killer][W1_USP]++; }
+				case CSW_P228:      { g_iWep1[killer][W1_P228]++; }
+				case CSW_DEAGLE:    { g_iWep1[killer][W1_DEAGLE]++; }
+				case CSW_ELITE:     { g_iWep1[killer][W1_ELITE]++; }
+				case CSW_FIVESEVEN: { g_iWep1[killer][W1_FIVESEVEN]++; }
+				case CSW_KNIFE:     { g_iWep1[killer][W1_KNIFE]++; g_iStats[killer][STAT_POINTS] += 2; }
+				case CSW_HEGRENADE: { g_iWep1[killer][W1_HEGRENADE]++; }
+
+				case CSW_M3:        { g_iWep2[killer][W2_M3]++; }
+				case CSW_XM1014:    { g_iWep2[killer][W2_XM1014]++; }
+				case CSW_TMP:       { g_iWep2[killer][W2_TMP]++; }
+				case CSW_UMP45:     { g_iWep2[killer][W2_UMP45]++; }
+				case CSW_MAC10:     { g_iWep2[killer][W2_MAC10]++; }
+				case CSW_MP5NAVY:   { g_iWep2[killer][W2_MP5NAVY]++; }
+				case CSW_P90:       { g_iWep2[killer][W2_P90]++; }
+
+				case CSW_GALIL:     { g_iWep2[killer][W2_GALIL]++; }
+				case CSW_FAMAS:     { g_iWep2[killer][W2_FAMAS]++; }
+				case CSW_AK47:      { g_iWep2[killer][W2_AK47]++; }
+				case CSW_M4A1:      { g_iWep2[killer][W2_M4A1]++; }
+				case CSW_SCOUT:     { g_iWep2[killer][W2_SCOUT]++; }
+				case CSW_SG552:     { g_iWep2[killer][W2_SG552]++; }
+				case CSW_AWP:       { g_iWep2[killer][W2_AWP]++; }
+				case CSW_G3SG1:     { g_iWep2[killer][W2_G3SG1]++; }
+				case CSW_AUG:       { g_iWep2[killer][W2_AUG]++; }
+				case CSW_SG550:     { g_iWep2[killer][W2_SG550]++; }
+				case CSW_M249:      { g_iWep2[killer][W2_M249]++; }
+			}
+
+			if (hitplace == HIT_HEAD && wpnindex != CSW_KNIFE && wpnindex != CSW_HEGRENADE)
+			{
+				g_iStats[killer][STAT_HSP] += 1
+				g_iStats[killer][STAT_POINTS] += 1
+			}
+
+			// Si la baja ocurrio tras Round_End (ej. cazando arma guardada antes de HLTV), actualizar multikill y guardado
+			if (g_bMultikillsAwarded)
+			{
+				SyncPlayerRoundMultikill(killer)
+				if (g_iLoadedMask[killer] != 0)
 				{
-					case 1: { g_szPoints_v1[killer]++; g_szPoints[killer] += 3; }  // 1v1
-					case 2: { g_szPoints_v2[killer]++; g_szPoints[killer] += 5; }  // 1v2
-					case 3: { g_szPoints_v3[killer]++; g_szPoints[killer] += 7; }  // 1v3
-					case 4: { g_szPoints_v4[killer]++; g_szPoints[killer] += 10; } // 1v4
-					default: {
-						if (num_enemies >= 5) 
-						{ 
-							g_szPoints_v5[killer]++; 
-							g_szPoints[killer] += 15; // 1v5 o superior
-						}
-					}
+					remove_task(CONNECT_TASK3 + killer)
+					set_task(1.0, "SavePointsAtRoundEnd", CONNECT_TASK3 + killer)
 				}
 			}
 		}
 	}
-	
-	// Estadísticas secundarias de víctima y headshots
-	if (!CheckUserIgnored(victim) && wpnindex != CSW_C4)
+
+	if (IsPlayer(victim) && is_user_connected(victim) && !is_user_bot(victim))
 	{
-		g_szPoints_d[victim] += 1;
+		if (g_iCurrentKills[victim] > g_iBestLifeKills[victim])
+		{
+			g_iBestLifeKills[victim] = g_iCurrentKills[victim]
+		}
+		g_iCurrentKills[victim] = 0
+
+		if (!g_bRoundEnded)
+		{
+			g_bDiedInRound[victim] = true
+		}
+
+		if (bps_players[victim] == 1 && wpnindex != CSW_C4 && (killer == 0 || killer == victim || !IsPlayer(killer) || bCountBots || !is_user_bot(killer)))
+		{
+			g_iStats[victim][STAT_DEATHS] += 1
+		}
 	}
-	
-	if (hitplace == HIT_HEAD && wpnindex != CSW_KNIFE)
+
+	if (!g_bRoundEnded && IsPlayer(victim) && (vTeam == CS_TEAM_T || vTeam == CS_TEAM_CT))
 	{
-		g_szPoints_hsp[killer] += 1;
+		CheckTeamClutch(vTeam, victim)
 	}
-	
-	return PLUGIN_CONTINUE;
+
+	return PLUGIN_CONTINUE
 }
 
-public Ham_Killed_player(iVictim, iAttacker, shouldgib) 
+public Ham_Killed_player(iVictim, iAttacker, shouldgib)
 {
-	new i = 1; // Por seguridad en AMX Mod X, usualmente los index de jugadores empiezan en 1
-	do {
-		if (i != iAttacker && i != iVictim) 
+	if (g_bRoundRestarting || !IsPlayer(iVictim) || !CheckMatchLiveState() || !g_bValidTeams)
+		return HAM_IGNORED
+
+	if (!ShouldCountBotsInMatch() && is_user_bot(iVictim))
+		return HAM_IGNORED
+
+	new CsTeams:victimTeam = SafeGetUserTeam(iVictim)
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		if (i != iAttacker && i != iVictim && is_user_connected(i) && !is_user_bot(i))
 		{
-			if (pug_dmg[i][iVictim] > 30) 
+			new CsTeams:attTeam = SafeGetUserTeam(i)
+			if ((attTeam == CS_TEAM_T || attTeam == CS_TEAM_CT) && attTeam != victimTeam && pug_dmg[i][iVictim] >= 30)
 			{
-				assist(i, iVictim);
+				assist(i, iVictim)
 			}
 		}
-		i += 1;
-	} while (i <= MaxClients); // Es mejor usar MaxClients en lugar de un número fijo como 33
+		pug_dmg[i][iVictim] = 0
+	}
+	return HAM_IGNORED
 }
 
 public assist(attacker, victim)
 {
 	pug_dmg[attacker][victim] = 0
-	g_szPoints_a[attacker]++
-	g_szPoints[attacker] += 2
+	if (!is_user_bot(attacker) && IsMatchTrackingActive() && bps_players[attacker] == 1)
+	{
+		g_iStats[attacker][STAT_ASSISTS]++
+		g_iStats[attacker][STAT_POINTS] += 2
+	}
 }
 
-public FwdPlayerSpawnPost(iPlayer) 
+public FwdPlayerSpawnPost(iPlayer)
 {
-	if (!is_user_connected(iPlayer))
-		return;
-	
-	// Limpiamos los contadores del jugador que reaparece
-	g_iCurrentKills[iPlayer] = 0;
-	g_iCurrentKills_v[iPlayer] = 0;
-	
-	// Limpiamos el almacenamiento de daño que hizo o recibió este jugador
-	for (new i = 1; i <= MaxClients; i++) 
+	if (!is_user_connected(iPlayer) || !is_user_alive(iPlayer))
+		return
+
+	if (g_bPendingRestartReset)
 	{
-		pug_dmg[iPlayer][i] = 0;
+		EventNewRound()
+	}
+
+	new CsTeams:team = SafeGetUserTeam(iPlayer)
+
+	if (is_user_bot(iPlayer))
+	{
+		if (team == CS_TEAM_T || team == CS_TEAM_CT)
+			bps_players[iPlayer] = 1
+		UpdateValidTeams()
+	}
+	else if (CheckMatchLiveState())
+	{
+		if ((team == CS_TEAM_T || team == CS_TEAM_CT) && !g_bLanBlocked[iPlayer] && g_iLoadedMask[iPlayer] == 15)
+		{
+			bps_players[iPlayer] = 1
+			g_bPlayedActiveMatch[iPlayer] = true
+		}
+	}
+
+	if (!IsPugModeEnabled())
+	{
+		g_iCurrentKills[iPlayer] = 0
+		g_iBestLifeKills[iPlayer] = 0
+		g_iRoundMkTier[iPlayer] = 0
+		g_iRoundDmg[iPlayer] = 0
+		g_bDiedInRound[iPlayer] = false
+		g_bUsedSecondLife[iPlayer] = false
+		bps_players_versus[iPlayer] = 0
+
+		for (new i = 1; i <= g_iMaxPlayers; i++)
+		{
+			pug_dmg[iPlayer][i] = 0
+			pug_dmg[i][iPlayer] = 0
+		}
+	}
+	else
+	{
+		// En modo PUG, al controlar un BOT (+use / .bot) tras haber muerto en la ronda activa:
+		// contar racha 2K-5K por vida separada (conservando mejor racha previa) y deshabilitar 1vX en segunda vida.
+		if (!is_user_bot(iPlayer) && !g_bRoundEnded && !g_bRoundRestarting && g_bDiedInRound[iPlayer])
+		{
+			if (g_iCurrentKills[iPlayer] > g_iBestLifeKills[iPlayer])
+			{
+				g_iBestLifeKills[iPlayer] = g_iCurrentKills[iPlayer]
+			}
+			g_iCurrentKills[iPlayer] = 0
+			g_bUsedSecondLife[iPlayer] = true
+			bps_players_versus[iPlayer] = 0
+		}
+
+		for (new i = 1; i <= g_iMaxPlayers; i++)
+		{
+			pug_dmg[i][iPlayer] = 0
+		}
+	}
+
+	if (!g_bRoundEnded && !g_bRoundRestarting && (team == CS_TEAM_T || team == CS_TEAM_CT))
+	{
+		new iAliveMates = 0
+		for (new i = 1; i <= g_iMaxPlayers; i++)
+		{
+			if (is_user_connected(i) && !is_user_hltv(i) && is_user_alive(i) && SafeGetUserTeam(i) == team)
+				iAliveMates++
+		}
+
+		if (iAliveMates >= 2)
+		{
+			g_bTeamHadTeammate[_:team] = true
+			for (new i = 1; i <= g_iMaxPlayers; i++)
+			{
+				if (is_user_connected(i) && SafeGetUserTeam(i) == team)
+					bps_players_versus[i] = 0
+			}
+		}
 	}
 }
 
 public FwdPlayerDamagePost(victim, inflictor, attacker, Float:damage, bits)
 {
-	// Validamos que el atacante sea un jugador y que no sea la misma persona (auto-daño / propia granada)
-	if (IsPlayer(attacker) && victim != attacker)
+	if (g_bRoundRestarting || !CheckMatchLiveState() || !g_bValidTeams)
+		return
+
+	if (IsPlayer(attacker) && IsPlayer(victim) && victim != attacker && is_user_connected(attacker) && is_user_connected(victim))
 	{
-		// Validamos que pertenezcan a equipos contrarios para evitar el daño amigo (Team Damage)
-		if (cs_get_user_team(victim) != cs_get_user_team(attacker))
+		if (is_user_bot(attacker) || bps_players[attacker] != 1)
+			return
+
+		if (!ShouldCountBotsInMatch() && is_user_bot(victim))
+			return
+
+		new CsTeams:vTeam = SafeGetUserTeam(victim)
+		new CsTeams:aTeam = SafeGetUserTeam(attacker)
+		if ((vTeam == CS_TEAM_T || vTeam == CS_TEAM_CT) && (aTeam == CS_TEAM_T || aTeam == CS_TEAM_CT) && vTeam != aTeam)
 		{
-			pug_dmg[attacker][victim] += damage;
-			g_szPoints_adr[attacker] += damage;
+			new Float:flRealDmg = 0.0
+			pev(victim, pev_dmg_take, flRealDmg)
+			if (flRealDmg <= 0.0)
+				flRealDmg = damage
+
+			new iDamage = clamp(floatround(flRealDmg, floatround_floor), 0, 100)
+			if (iDamage > 0)
+			{
+				pug_dmg[attacker][victim] += iDamage
+				g_iRoundDmg[attacker] += iDamage
+				g_iStats[attacker][STAT_ADR] += iDamage
+			}
 		}
 	}
 }
 
-stock Float:get_percent(iTotal, iParcial) 
+stock DetectPugSystem()
 {
-	if (iTotal <= 0) return 0.0; // Protección contra división por cero
-	return float((iParcial * 100.0) / iTotal);
+	g_xvarPugStatus = get_xvar_id("pug_status")
+	g_xvarPugStage = get_xvar_id("pug_stage")
+	g_bPugDetected = (g_xvarPugStatus != -1 && g_xvarPugStage != -1)
+}
+
+stock bool:IsPugModeEnabled()
+{
+	new iSync = get_pcvar_num(pcvarPugSync)
+	if (iSync <= 0)
+		return false
+	if (iSync == 1)
+		return true
+
+	if (!g_bPugDetected)
+		DetectPugSystem()
+
+	return g_bPugDetected
+}
+
+stock bool:IsPugMatchLive()
+{
+	if (!g_bPugDetected)
+		return g_bPugForwardLive
+
+	new iStatus = get_xvar_num(g_xvarPugStatus)
+	if (iStatus != BPS_PUG_STATUS_LIVE)
+		return false
+
+	new iStage = get_xvar_num(g_xvarPugStage)
+	return (iStage == BPS_PUG_STAGE_FIRSTHALF || iStage == BPS_PUG_STAGE_SECONDHALF || iStage == BPS_PUG_STAGE_OVERTIME)
+}
+
+stock bool:IsPugMatchInProgress()
+{
+	if (!g_bPugMatchStartedLive)
+		return false
+
+	if (!g_bPugDetected)
+		return g_bPugForwardLive
+
+	new iStage = get_xvar_num(g_xvarPugStage)
+	if (iStage != BPS_PUG_STAGE_FIRSTHALF && iStage != BPS_PUG_STAGE_SECONDHALF && iStage != BPS_PUG_STAGE_OVERTIME && iStage != BPS_PUG_STAGE_INTERMISSION)
+		return false
+
+	new iStatus = get_xvar_num(g_xvarPugStatus)
+	if (iStage == BPS_PUG_STAGE_FIRSTHALF && (iStatus & BPS_PUG_STATUS_WAITING))
+		return false
+
+	return true
+}
+
+stock bool:IsStatsActive()
+{
+	return (g_bDatabaseReady && get_pcvar_num(pcvarToggle2) && get_pcvar_num(pcvarSaveType) != 0)
+}
+
+stock bool:IsMatchTrackingActive()
+{
+	if (!IsStatsActive())
+		return false
+
+	if (IsPugModeEnabled())
+		return IsPugMatchLive()
+
+	return true
+}
+
+stock SyncActiveMatchPlayers(bool:bNotify = false)
+{
+	if (!IsMatchTrackingActive())
+		return
+
+	for (new id = 1; id <= g_iMaxPlayers; id++)
+	{
+		if (!is_user_connected(id) || is_user_hltv(id))
+			continue
+
+		new CsTeams:team = SafeGetUserTeam(id)
+		if (is_user_bot(id))
+		{
+			bps_players[id] = (team == CS_TEAM_T || team == CS_TEAM_CT) ? 1 : 15
+			continue
+		}
+
+		if (team == CS_TEAM_T || team == CS_TEAM_CT)
+		{
+			if (g_bLanBlocked[id])
+			{
+				bps_players[id] = 15
+				if (bNotify)
+					client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_STEAM_ONLY")
+			}
+			else if (g_iLoadedMask[id] == 15)
+			{
+				new bool:bWasInactive = (bps_players[id] != 1)
+				bps_players[id] = 1
+				g_bPlayedActiveMatch[id] = true
+				if (bNotify && bWasInactive)
+					client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_SET_ID_1")
+			}
+			else if (!g_bLoadStarted[id])
+			{
+				TryStartLoad(id)
+			}
+		}
+		else
+		{
+			bps_players[id] = 15
+		}
+	}
+
+	UpdateValidTeams()
+}
+
+stock bool:CheckMatchLiveState()
+{
+	if (!IsMatchTrackingActive())
+	{
+		g_bWasLiveTracking = false
+		return false
+	}
+
+	if (!g_bWasLiveTracking)
+	{
+		g_bWasLiveTracking = true
+		g_bPugMatchStartedLive = true
+		g_bPugWinnerHandled = false
+		SyncActiveMatchPlayers(true)
+	}
+
+	g_bRoundWasLive = true
+	if (g_bValidTeams)
+	{
+		g_bRoundHadValidTeams = true
+	}
+	return true
+}
+
+stock bool:ShouldCountBotsInMatch()
+{
+	if (get_pcvar_num(pcvarToggleBots))
+		return true
+
+	if (IsPugModeEnabled() && (IsPugMatchLive() || g_bRoundWasLive))
+		return true
+
+	return false
+}
+
+stock UpdateValidTeams()
+{
+	g_bValidTeams = HasValidTeams()
+	if (g_bValidTeams && !g_bRoundEnded && !g_bRoundRestarting && (IsMatchTrackingActive() || g_bRoundWasLive))
+	{
+		g_bRoundHadValidTeams = true
+	}
+}
+
+stock bool:HasValidTeams()
+{
+	new iNumT = 0, iNumCT = 0, iRealPlaying = 0
+	new bool:bCountBots = ShouldCountBotsInMatch()
+
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		if (!is_user_connected(i) || is_user_hltv(i))
+			continue
+
+		new bool:bIsBot = bool:is_user_bot(i)
+		if (bIsBot && !bCountBots)
+			continue
+
+		new CsTeams:team = SafeGetUserTeam(i)
+		if (team == CS_TEAM_T)
+		{
+			iNumT++
+			if (!bIsBot)
+				iRealPlaying++
+		}
+		else if (team == CS_TEAM_CT)
+		{
+			iNumCT++
+			if (!bIsBot)
+				iRealPlaying++
+		}
+	}
+
+	if (bCountBots && iRealPlaying < 1)
+		return false
+
+	return (iNumT >= 1 && iNumCT >= 1)
+}
+
+stock HandleTeamRoundWin(CsTeams:winningTeam)
+{
+	UpdateValidTeams()
+	new bool:bLiveRound = (CheckMatchLiveState() || g_bRoundWasLive)
+	new bool:bValidRoundTeams = (g_bValidTeams || g_bRoundHadValidTeams)
+	if (g_bRoundEnded || g_bRoundRestarting || !IsStatsActive() || !bLiveRound || !bValidRoundTeams)
+		return
+
+	new Players[MAXPLAYERS], iNum
+	get_players(Players, iNum, "ch")
+
+	new iTeamTotalDmg = 0
+	for (new i = 0; i < iNum; i++)
+	{
+		new pid = Players[i]
+		if (bps_players[pid] == 1 && SafeGetUserTeam(pid) == winningTeam)
+		{
+			iTeamTotalDmg += g_iRoundDmg[pid]
+		}
+	}
+
+	for (new i = 0, id; i < iNum; i++)
+	{
+		id = Players[i]
+
+		if (bps_players[id] != 1)
+		{
+			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_DESACT_ID_15")
+			continue
+		}
+
+		new CsTeams:team = SafeGetUserTeam(id)
+		if (team == winningTeam)
+		{
+			g_iStats[id][STAT_POINTS] += 1
+			g_iStats[id][STAT_RP] += 1
+
+			if (iTeamTotalDmg > 0 && g_iRoundDmg[id] > 0)
+			{
+				g_iStats[id][STAT_RWS] += floatround((float(g_iRoundDmg[id]) * 100.0) / float(iTeamTotalDmg), floatround_round)
+			}
+
+			if (bps_players_versus[id] > 0 && !g_bUsedSecondLife[id] && (is_user_alive(id) || team == CS_TEAM_T))
+			{
+				AwardVersusClutch(id, bps_players_versus[id])
+			}
+			bps_players_versus[id] = 0
+
+			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_ACT_ID_1")
+		}
+		else if (team == CS_TEAM_T || team == CS_TEAM_CT)
+		{
+			bps_players_versus[id] = 0
+			g_iStats[id][STAT_RLOS] += 1
+
+			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_ACT_ID_1")
+		}
+	}
+
+	g_bRoundEnded = true
+	AwardRoundMultikills()
 }
 
 public TerroristsWin()
 {
-	// 1. Verificamos si la ronda ya terminó o si el sistema general de puntos está desactivado
-	if (g_bRoundEnded || !get_pcvar_num(pcvarToggle2))
-	{
-		return PLUGIN_CONTINUE;
-	}
-	
-	new Players[MAXPLAYERS];
-	new iNum;
-	
-	// Obtenemos solo a los jugadores conectados y que no sean espectadores ("ch")
-	get_players(Players, iNum, "ch");
-	
-	for (new i, id; i < iNum; i++)
-	{
-		id = Players[i];
-		
-		// Verificamos si el jugador tiene el sistema activo (usamos 'continue' en lugar de 'return' para no romper el bucle)
-		if (bps_players[id] != 1)
-		{
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15");
-			continue; // Salta al siguiente jugador sin detener la función
-		}
-		
-		// Lógica según el bando ganador (Terroristas)
-		switch (cs_get_user_team(id))
-		{
-			case CS_TEAM_T: 
-			{
-				bps_players_round_save[id] = 1;
-				g_szPoints[id] += 1;
-				g_szPoints_rws[id] += 1;
-				g_szPoints_rp[id] += 1;
-				
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1");
-			}
-			case CS_TEAM_CT: 
-			{
-				bps_players_round_save[id] = 1;
-				bps_players_versus[id] = 0;
-				g_szPoints_r_los[id] += 1;
-				
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1");
-			}
-		}
-	}
-	
-	g_bRoundEnded = true;
-	return PLUGIN_CONTINUE;
+	HandleTeamRoundWin(CS_TEAM_T)
+	return PLUGIN_CONTINUE
 }
 
 public CounterTerroristsWin()
 {
-	// 1. Verificamos si la ronda ya terminó o si el sistema general de puntos está desactivado
-	if (g_bRoundEnded || !get_pcvar_num(pcvarToggle2))
+	HandleTeamRoundWin(CS_TEAM_CT)
+	return PLUGIN_CONTINUE
+}
+
+stock AwardVersusClutch(id, iEnemies)
+{
+	switch (iEnemies)
 	{
-		return PLUGIN_CONTINUE;
-	}
-	
-	new Players[MAXPLAYERS];
-	new iNum;
-	
-	// Obtenemos solo a los jugadores conectados y que no sean espectadores ("ch")
-	get_players(Players, iNum, "ch");
-	
-	for (new i, id; i < iNum; i++)
-	{
-		id = Players[i];
-		
-		// Verificamos si el jugador tiene el sistema activo (usamos 'continue' para no romper el bucle)
-		if (bps_players[id] != 1)
-		{
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15");
-			continue; // Salta al siguiente jugador de forma segura
-		}
-		
-		// Lógica según el bando ganador (Counter-Terrorists)
-		switch (cs_get_user_team(id))
-		{
-			case CS_TEAM_T: 
+		case 1: { g_iVersus[id][VS_V1]++; g_iStats[id][STAT_POINTS] += 3; }
+		case 2: { g_iVersus[id][VS_V2]++; g_iStats[id][STAT_POINTS] += 5; }
+		case 3: { g_iVersus[id][VS_V3]++; g_iStats[id][STAT_POINTS] += 7; }
+		case 4: { g_iVersus[id][VS_V4]++; g_iStats[id][STAT_POINTS] += 10; }
+		default: {
+			if (iEnemies >= 5)
 			{
-				bps_players_round_save[id] = 1;
-				bps_players_versus[id] = 0;
-				g_szPoints_r_los[id] += 1;
-				
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1");
-			}
-			case CS_TEAM_CT: 
-			{
-				bps_players_round_save[id] = 1;
-				g_szPoints[id] += 1;
-				g_szPoints_rws[id] += 1;
-				g_szPoints_rp[id] += 1;
-				
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1");
+				g_iVersus[id][VS_V5]++;
+				g_iStats[id][STAT_POINTS] += 15;
 			}
 		}
 	}
-	
-	g_bRoundEnded = true;
-	return PLUGIN_CONTINUE;
 }
 
 public Event_RoundDraw()
 {
-	// 1. Verificamos si la ronda ya terminó o si el sistema general de puntos está desactivado
-	if (g_bRoundEnded || !get_pcvar_num(pcvarToggle2))
-	{
-		return PLUGIN_CONTINUE;
-	}
-	
-	new Players[MAXPLAYERS];
-	new iNum;
-	
-	// Obtenemos solo a los jugadores conectados y que no sean espectadores ("ch")
-	get_players(Players, iNum, "ch");
-	
+	UpdateValidTeams()
+	new bool:bLiveRound = (CheckMatchLiveState() || g_bRoundWasLive)
+	new bool:bValidRoundTeams = (g_bValidTeams || g_bRoundHadValidTeams)
+	if (g_bRoundEnded || g_bRoundRestarting || !IsStatsActive() || !bLiveRound || !bValidRoundTeams)
+		return PLUGIN_CONTINUE
+
+	new Players[MAXPLAYERS], iNum
+	get_players(Players, iNum, "ch")
+
 	for (new i, id; i < iNum; i++)
 	{
-		id = Players[i];
-		
-		// Verificamos si el jugador tiene el sistema activo
+		id = Players[i]
 		if (bps_players[id] != 1)
 		{
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15");
-			continue; // Salta al siguiente jugador de forma segura sin romper el bucle
+			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_DESACT_ID_15")
+			continue
 		}
-		
-		// En caso de empate (Round Draw), ambos equipos reciben el estado configurado (15)
-		switch (cs_get_user_team(id))
-		{
-			case CS_TEAM_T, CS_TEAM_CT: 
-			{
-				bps_players_round_save[id] = 15;
-			}
-		}
+		bps_players_versus[id] = 0
 	}
-	
-	g_bRoundEnded = true;
-	return PLUGIN_CONTINUE;
+
+	g_bRoundEnded = true
+	return PLUGIN_CONTINUE
 }
 
 public points_all_pugend( id, level, cid )
 {
-	if ( !cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
-	
-	new Players[ MAXPLAYERS ]
-	new iNum
-	new i
+	if (!cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
+	if (!IsStatsActive()) return PLUGIN_HANDLED
+
+	new Players[ MAXPLAYERS ], iNum, i
 	get_players( Players, iNum, "ch" )
-	for( --iNum; iNum >= 0; iNum-- )
+	for (new idx = 0; idx < iNum; idx++)
 	{
-		i = Players[ iNum ]
-		if( !CheckUserIgnored( i ))
+		i = Players[ idx ]
+		g_bPlayedActiveMatch[ i ] = false
+
+		new CsTeams:team = SafeGetUserTeam( i )
+		if (team != CS_TEAM_T && team != CS_TEAM_CT)
+			continue
+
+		if (bps_players[i] == 1)
 		{
-			g_szPoints[ i ] += 15
+			g_iStats[ i ][ STAT_POINTS ] += 15
+			FlushPlayerStats( i, true )
 		}
 	}
-	if(bps_players[id] == 15)
-	{
-		// client_print(id, print_chat, "BPS - *MINIMO Point All END* PASSE.!")
-		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-	}
-	return PLUGIN_CONTINUE
+	return PLUGIN_HANDLED
 }
 
 public points_win_ct( id, level, cid )
 {
-	if ( !cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
-	
-	new Players[ MAXPLAYERS ]
-	new iNum
-	new i
+	if (!cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
+	if (!IsStatsActive()) return PLUGIN_HANDLED
+
+	new Players[ MAXPLAYERS ], iNum, i
 	get_players( Players, iNum, "ch" )
-	for( --iNum; iNum >= 0; iNum-- )
+	for (new idx = 0; idx < iNum; idx++)
 	{
-		i = Players[ iNum ]
-		if(bps_players[i] == 15)
+		i = Players[ idx ]
+		g_bPlayedActiveMatch[ i ] = false
+
+		new CsTeams:team = SafeGetUserTeam( i )
+		if (team != CS_TEAM_T && team != CS_TEAM_CT)
+			continue
+
+		if (bps_players[i] == 1)
 		{
-			// client_print(id, print_chat, "BPS - *TERRORIS = ID = 15 Desactivado* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
-		}
-		if(bps_players[i] == 1)
-		{
-			if( get_pcvar_num( pcvarToggle2 ) )
+			if (team == CS_TEAM_T)
 			{
-				if( !CheckUserIgnored( i ))
-				{
-					switch( cs_get_user_team( i ))
-					{
-						case( CS_TEAM_T ):
-						{
-							g_szPoints_r_los[ i ] += 1
-							bps_players_versus[ i ] = 0
-						}
-						case( CS_TEAM_CT ):
-						{
-							g_szPoints_rws[ i ] += 1
-							g_szPoints_rp[ i ] += 1
-						}
-					}
-					// client_print(id, print_chat, "BPS - *TERRORIS = ID = 1 Activado* PASSE.!")
-					client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1")
-					return PLUGIN_CONTINUE
-				}
+				g_iStats[ i ][ STAT_LOS ] += 1
+				bps_players_versus[ i ] = 0
 			}
-			else {
-				// client_print(id, print_chat, "BPS - *EL STATS, ESTA DESACTIVADO* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_OFF_ID")
-				return PLUGIN_CONTINUE
+			else if (team == CS_TEAM_CT)
+			{
+				g_iStats[ i ][ STAT_WIN ] += 1
+				g_iStats[ i ][ STAT_POINTS ] += 10
 			}
-		}
-		else {
-			// client_print(id, print_chat, "BPS - *NO TIENES EL ID=1* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
+			FlushPlayerStats( i, true )
 		}
 	}
-	return PLUGIN_CONTINUE
+	return PLUGIN_HANDLED
 }
 
 public points_win_t( id, level, cid )
 {
 	if (!cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
-	
-	new Players[ MAXPLAYERS ]
-	new iNum
-	new i
-	
+	if (!IsStatsActive()) return PLUGIN_HANDLED
+
+	new Players[ MAXPLAYERS ], iNum, i
 	get_players( Players, iNum, "ch" )
-	for( --iNum; iNum >= 0; iNum-- )
+	for (new idx = 0; idx < iNum; idx++)
 	{
-		i = Players[ iNum ]
-		if(bps_players[i] == 15)
+		i = Players[ idx ]
+		g_bPlayedActiveMatch[ i ] = false
+
+		new CsTeams:team = SafeGetUserTeam( i )
+		if (team != CS_TEAM_T && team != CS_TEAM_CT)
+			continue
+
+		if (bps_players[i] == 1)
 		{
-			// client_print(id, print_chat, "BPS - *TERRORIS = ID = 15 Desactivado* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
-		}
-		if(bps_players[i] == 1)
-		{
-			if( get_pcvar_num( pcvarToggle2 ) )
+			if (team == CS_TEAM_T)
 			{
-				if( !CheckUserIgnored( i ))
-				{
-					switch( cs_get_user_team( i ))
-					{
-						case( CS_TEAM_T ):
-						{
-							g_szPoints_rws[ i ] += 1
-							g_szPoints_rp[ i ] += 1
-						}
-						case( CS_TEAM_CT ):
-						{
-							g_szPoints_r_los[ i ] += 1
-							bps_players_versus[ i ] = 0
-						}
-					}
-					// client_print(id, print_chat, "BPS - *TERRORIS = ID = 1 Activado* PASSE.!")
-					client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1")
-					return PLUGIN_CONTINUE
-				}
+				g_iStats[ i ][ STAT_WIN ] += 1
+				g_iStats[ i ][ STAT_POINTS ] += 10
 			}
-			else {
-				// client_print(id, print_chat, "BPS - *EL STATS, ESTA DESACTIVADO* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_OFF_ID")
-				return PLUGIN_CONTINUE
+			else if (team == CS_TEAM_CT)
+			{
+				g_iStats[ i ][ STAT_LOS ] += 1
+				bps_players_versus[ i ] = 0
 			}
-		}
-		else {
-			// client_print(id, print_chat, "BPS - *NO TIENES EL ID=1* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
+			FlushPlayerStats( i, true )
 		}
 	}
-	return PLUGIN_CONTINUE
+	return PLUGIN_HANDLED
 }
 
 public points_tied( id, level, cid )
 {
-	if ( !cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
-	
-	new Players[ MAXPLAYERS ]
-	new iNum
-	new i
-	
+	if (!cmd_access( id, level, cid, 1 )) return PLUGIN_HANDLED
+	if (!IsStatsActive()) return PLUGIN_HANDLED
+
+	new Players[ MAXPLAYERS ], iNum, i
 	get_players( Players, iNum, "ch" )
-	for( --iNum; iNum >= 0; iNum-- )
+	for (new idx = 0; idx < iNum; idx++)
 	{
-		i = Players[ iNum ]
-		if(bps_players[i] == 15)
+		i = Players[ idx ]
+		g_bPlayedActiveMatch[ i ] = false
+
+		new CsTeams:team = SafeGetUserTeam( i )
+		if (team != CS_TEAM_T && team != CS_TEAM_CT)
+			continue
+
+		if (bps_players[i] == 1)
 		{
-			// client_print(id, print_chat, "BPS - *TERRORIS = ID = 15 Desactivado* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
-		}
-		if(bps_players[i] == 1)
-		{
-			if( get_pcvar_num( pcvarToggle2 ) )
-			{
-				if( !CheckUserIgnored( i ))
-				{
-					switch( cs_get_user_team( i ))
-					{
-						case( CS_TEAM_T ):
-						{
-							g_szPoints_rws[ i ] += 1
-							g_szPoints_rp[ i ] += 1
-							bps_players_versus[ i ] = 0
-						}
-						case( CS_TEAM_CT ):
-						{
-							g_szPoints_rws[ i ] += 1
-							g_szPoints_rp[ i ] += 1
-							bps_players_versus[ i ] = 0
-						}
-					}
-					// client_print(id, print_chat, "BPS - *TERRORIS = ID = 1 Activado* PASSE.!")
-					client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_ACT_ID_1")
-					return PLUGIN_CONTINUE
-				}
-			}
-			else {
-				// client_print(id, print_chat, "BPS - *EL STATS, ESTA DESACTIVADO* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_OFF_ID")
-				return PLUGIN_CONTINUE
-			}
-		}
-		else {
-			// client_print(id, print_chat, "BPS - *NO TIENES EL ID=1* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
+			g_iStats[ i ][ STAT_TIED ] += 1
+			g_iStats[ i ][ STAT_POINTS ] += 3
+			bps_players_versus[ i ] = 0
+			FlushPlayerStats( i, true )
 		}
 	}
-	return PLUGIN_CONTINUE
+	return PLUGIN_HANDLED
 }
 
 public bomb_planted( planter )
 {
-	new id
-	new Players[ MAXPLAYERS ]
-	new iNum
-	get_players( Players, iNum, "ch" )
-	if(bps_players[planter] == 1)
-	{
-		if(get_pcvar_num(pcvarToggle2))
-		{
-			if(get_playersnum() >= 2)
-			{
-				g_szPoints_bp[ planter ] += 1
-				g_szPoints[ planter ] += 3
-				//client_print(id, print_chat, "BPS - *PLANTAR C4 Contado* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_PLANT_C4")
-				return PLUGIN_CONTINUE
-			}
-			else {
-				// client_print(id, print_chat, "BPS - *PLANTAR, 2 JUGADOR MINIMO* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_PLANT_C4_MINI")
-				return PLUGIN_CONTINUE
-			}
-			} else {
-			// client_print(id, print_chat, "BPS - *EL STATS, ESTA DESACTIVADO* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_OFF_ID")
-			return PLUGIN_CONTINUE
-		}
-		} else {
-		//client_print(id, print_chat, "BPS - *PLANTAR, NO TIENES EL ID=1* PASSE.!")
-		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
+	if (!CheckMatchLiveState() || !IsPlayer(planter) || !is_user_connected(planter) || is_user_bot(planter))
 		return PLUGIN_CONTINUE
+
+	if (bps_players[planter] == 1)
+	{
+		if (g_bValidTeams)
+		{
+			g_iStats[planter][STAT_BP] += 1
+			g_iStats[planter][STAT_POINTS] += 3
+			client_print_color(planter, print_team_default, "^4%s ^1%L", pug_panama, planter, "BPS_PLANT_C4")
+		}
+		else
+		{
+			client_print_color(planter, print_team_default, "^4%s ^1%L", pug_panama, planter, "BPS_PLANT_C4_MINI")
+		}
 	}
+	else
+	{
+		client_print_color(planter, print_team_default, "^4%s ^1%L", pug_panama, planter, "BPS_DESACT_ID_15")
+	}
+	return PLUGIN_CONTINUE
 }
 
 public bomb_explode( planter, defuser )
 {
-	new id
-	new Players[ MAXPLAYERS ]
-	new iNum
-	get_players( Players, iNum, "ch" )
-	if(bps_players[planter] == 1)
-	{
-		if(get_pcvar_num(pcvarToggle2))
-		{
-			if(get_playersnum() >= 2)
-			{
-				g_szCSW_C4[ planter ] += 1
-				g_szPoints[ planter ] += 5
-				// client_print(id, print_chat, "BPS - *EXPLOCION Marcados* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_EXPLO_C4")
-				return PLUGIN_CONTINUE
-			}
-			else {
-				// client_print(id, print_chat, "BPS - *EXPLOCION, 2 JUGADOR MINIMO* PASSE.!")
-				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_EXPLO_C4_MINI")
-				return PLUGIN_CONTINUE
-			}
-			} else {
-			// client_print(id, print_chat, "BPS - *EL STATS, ESTA DESACTIVADO* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_OFF_ID")
-			return PLUGIN_CONTINUE
-		}
-		} else {
-		// client_print(id, print_chat, "BPS - *EXPLOCION, NO TIENES EL ID=1* PASSE.!")
-		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
+	if (!CheckMatchLiveState() || !IsPlayer(planter) || !is_user_connected(planter) || is_user_bot(planter) || bps_players[planter] != 1)
 		return PLUGIN_CONTINUE
+
+	if (g_bValidTeams)
+	{
+		g_iWep1[planter][W1_C4] += 1
+		g_iStats[planter][STAT_POINTS] += 5
+		client_print_color(planter, print_team_default, "^4%s ^1%L", pug_panama, planter, "BPS_EXPLO_C4")
 	}
+	else
+	{
+		client_print_color(planter, print_team_default, "^4%s ^1%L", pug_panama, planter, "BPS_EXPLO_C4_MINI")
+	}
+	return PLUGIN_CONTINUE
 }
 
 public bomb_defused( defuser )
 {
-	new id
-	new Players[ MAXPLAYERS ]
-	new iNum
-	get_players( Players, iNum, "ch" )
-	if(bps_players[defuser] == 1)
-	{
-		if(get_pcvar_num(pcvarToggle2))
-		{
-			g_szPoints[defuser] += 15
-			g_szPoints_bd[ defuser ] += 1
-			// client_print(id, print_chat, "BPS - *DEFUSER ID = 1* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DEFUSE")
-			return PLUGIN_CONTINUE
-			} else {
-			// client_print(id, print_chat, "BPS - *EL STATS, ESTA DESACTIVADO* PASSE.!")
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_OFF_ID")
-			return PLUGIN_CONTINUE
-		}
-		} else {
-		// client_print(id, print_chat, "BPS - *NO TIENES EL ID=1* PASSE.!")
-		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
+	if (!CheckMatchLiveState() || !IsPlayer(defuser) || !is_user_connected(defuser) || is_user_bot(defuser))
 		return PLUGIN_CONTINUE
+
+	if (bps_players[defuser] == 1)
+	{
+		if (g_bValidTeams)
+		{
+			g_iStats[defuser][STAT_POINTS] += 5
+			g_iStats[defuser][STAT_BD] += 1
+			client_print_color(defuser, print_team_default, "^4%s ^1%L", pug_panama, defuser, "BPS_DEFUSE")
+		}
+		else
+		{
+			client_print_color(defuser, print_team_default, "^4%s ^1%L", pug_panama, defuser, "BPS_DEFUSE_MINI")
+		}
+	}
+	else
+	{
+		client_print_color(defuser, print_team_default, "^4%s ^1%L", pug_panama, defuser, "BPS_DESACT_ID_15")
+	}
+	return PLUGIN_CONTINUE
+}
+
+public EventRestartRound()
+{
+	g_bRoundRestarting = true
+	g_bPendingRestartReset = true
+
+	if (!g_bRoundEnded)
+	{
+		g_bRoundWasLive = false
+		g_bRoundHadValidTeams = false
+	}
+
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		g_iCurrentKills[i] = 0
+		g_iBestLifeKills[i] = 0
+		g_iRoundMkTier[i] = 0
+		g_iRoundDmg[i] = 0
+		g_bDiedInRound[i] = false
+		g_bUsedSecondLife[i] = false
+		bps_players_versus[i] = 0
+		for (new j = 1; j <= g_iMaxPlayers; j++)
+		{
+			pug_dmg[i][j] = 0
+		}
 	}
 }
 
 public EventNewRound()
 {
-	g_bRoundEnded = false;
+	g_bRoundEnded = false
+	g_bRoundRestarting = false
+	g_bPendingRestartReset = false
+	g_bMultikillsAwarded = false
+	g_bRoundHadValidTeams = false
+	g_bPugWinnerHandled = false
+	arrayset(g_bTeamHadTeammate, false, sizeof(g_bTeamHadTeammate))
+	UpdateValidTeams()
+
+	new iAliveT = 0, iAliveCT = 0
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		g_iCurrentKills[i] = 0
+		g_iBestLifeKills[i] = 0
+		g_iRoundMkTier[i] = 0
+		g_iRoundDmg[i] = 0
+		g_bDiedInRound[i] = false
+		g_bUsedSecondLife[i] = false
+		bps_players_versus[i] = 0
+		for (new j = 1; j <= g_iMaxPlayers; j++)
+		{
+			pug_dmg[i][j] = 0
+		}
+
+		if (is_user_connected(i) && !is_user_hltv(i))
+		{
+			if (!IsMatchTrackingActive() && !is_user_bot(i))
+			{
+				bps_players[i] = 15
+			}
+
+			if (is_user_alive(i))
+			{
+				new CsTeams:team = SafeGetUserTeam(i)
+				if (team == CS_TEAM_T)
+					iAliveT++
+				else if (team == CS_TEAM_CT)
+					iAliveCT++
+			}
+		}
+	}
+
+	if (iAliveT >= 2)
+		g_bTeamHadTeammate[_:CS_TEAM_T] = true
+	if (iAliveCT >= 2)
+		g_bTeamHadTeammate[_:CS_TEAM_CT] = true
+
+	g_bRoundWasLive = CheckMatchLiveState()
+}
+
+public EventFreezeTimeEnd()
+{
+	g_bRoundRestarting = false
+	if (g_bPendingRestartReset)
+	{
+		EventNewRound()
+	}
+
+	if (CheckMatchLiveState() && g_bValidTeams && !g_bRoundEnded)
+	{
+		CheckTeamClutch(CS_TEAM_T)
+		CheckTeamClutch(CS_TEAM_CT)
+	}
+}
+
+stock GetMultikillTier(iKills)
+{
+	if (iKills >= 5)
+		return 5
+	if (iKills >= 2)
+		return iKills
+	return 0
+}
+
+stock ApplyMultikillTierDelta(id, iTier, iSign)
+{
+	switch (iTier)
+	{
+		case 2:
+		{
+			g_iVersus[id][VS_2K] += iSign
+			g_iStats[id][STAT_POINTS] += (5 * iSign)
+		}
+		case 3:
+		{
+			g_iVersus[id][VS_3K] += iSign
+			g_iStats[id][STAT_POINTS] += (10 * iSign)
+		}
+		case 4:
+		{
+			g_iVersus[id][VS_4K] += iSign
+			g_iStats[id][STAT_POINTS] += (15 * iSign)
+		}
+		case 5:
+		{
+			g_iVersus[id][VS_5K] += iSign
+			g_iStats[id][STAT_POINTS] += (20 * iSign)
+		}
+	}
+}
+
+stock SyncPlayerRoundMultikill(id)
+{
+	if (g_iLoadedMask[id] == 0 || bps_players[id] != 1 || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	new CsTeams:team = SafeGetUserTeam(id)
+	if (team != CS_TEAM_T && team != CS_TEAM_CT)
+		return
+
+	if (g_iCurrentKills[id] > g_iBestLifeKills[id])
+	{
+		g_iBestLifeKills[id] = g_iCurrentKills[id]
+	}
+
+	new iNewTier = GetMultikillTier(g_iBestLifeKills[id])
+	new iOldTier = g_iRoundMkTier[id]
+	if (iNewTier <= iOldTier)
+		return
+
+	if (iOldTier > 0)
+	{
+		ApplyMultikillTierDelta(id, iOldTier, -1)
+	}
+
+	ApplyMultikillTierDelta(id, iNewTier, 1)
+	g_iRoundMkTier[id] = iNewTier
+	g_iStats[id][STAT_POINTS] = max(0, g_iStats[id][STAT_POINTS])
+}
+
+stock AwardRoundMultikills()
+{
+	UpdateValidTeams()
+
+	if (!g_bValidTeams && !g_bRoundHadValidTeams && !g_bRoundEnded)
+		return
+
+	g_bMultikillsAwarded = true
+
+	new Players[MAXPLAYERS], iNum
+	get_players(Players, iNum, "ch")
+
+	for (new idx = 0; idx < iNum; idx++)
+	{
+		SyncPlayerRoundMultikill(Players[idx])
+	}
 }
 
 public EventRoundEnd()
 {
-	g_bRoundEnded = true;
-	
-	new Players[MAXPLAYERS], iNum, i;
-	get_players(Players, iNum, "ch"); // Obtenemos jugadores humanos conectados
-	
+	UpdateValidTeams()
+	if (!IsStatsActive())
+	{
+		g_bRoundWasLive = false
+		return
+	}
+
+	if (get_gametime() - g_flLastHeartbeat >= BPS_HEARTBEAT_INTERVAL)
+	{
+		SendServerHeartbeat()
+	}
+
+	new bool:bLiveRound = (CheckMatchLiveState() || g_bRoundWasLive)
+	g_bRoundWasLive = false
+
+	if (!bLiveRound)
+		return
+
+	g_bRoundEnded = true
+	AwardRoundMultikills()
+
+	new Players[MAXPLAYERS], iNum, i
+	get_players(Players, iNum, "ch")
+
 	for (new idx = 0; idx < iNum; idx++)
 	{
-		i = Players[idx];
-		
-		if (bps_players[i] == 1)
-		{
-			// --- LÓGICA DE MULTIKILLS AL FIN DE RONDA ---
-			switch (g_iCurrentKills[i])
-			{
-				case 2: { 
-					g_szPoints_2k[i]++; 
-					g_szPoints[i] += 5;  // Puntos extra por el 2K
-				}
-				case 3: { 
-					g_szPoints_3k[i]++; 
-					g_szPoints[i] += 10; // Puntos extra por el 3K
-				}
-				case 4: { 
-					g_szPoints_4k[i]++; 
-					g_szPoints[i] += 15; // Puntos extra por el 4K
-				}
-				default: {
-					if (g_iCurrentKills[i] >= 5)
-					{
-						g_szPoints_5k[i]++; 
-						g_szPoints[i] += 20; // Puntos extra por el 5K+
-					}
-				}
-			}
-			set_task(1.0, "SavePointsAtRoundEnd", CONNECT_TASK3 + i);
-		}
+		i = Players[idx]
+
+		if (g_iLoadedMask[i] == 0)
+			continue
+
+		remove_task(CONNECT_TASK3 + i)
+		set_task(1.0, "SavePointsAtRoundEnd", CONNECT_TASK3 + i)
 	}
 }
 
 public SavePointsAtRoundEnd(taskid)
 {
-	// Recuperamos el ID real restando la misma base exacta
-	new i = taskid - CONNECT_TASK3;
-	
-	// Verificamos por seguridad que el índice esté dentro del rango de jugadores válidos
-	if (!is_user_connected(i))
+	new i = taskid - CONNECT_TASK3
+
+	if (!is_user_connected(i) || is_user_bot(i) || is_user_hltv(i))
+		return
+
+	if (IsStatsActive())
 	{
-		return;
+		if (FlushPlayerStats(i, true))
+		{
+			client_print_color(i, print_team_default, "^4%s ^1%L", pug_panama, i, "BPS_DATA_SAVE")
+		}
 	}
-	
-	// Verificamos nuevamente que tenga el sistema activo
-	if (bps_players[i] == 1)
+	else if (bps_players[i] == 1)
 	{
-		// Ejecutamos las funciones de guardado exclusivamente para este jugador
-		CheckLevelAndSave1(i);
-		CheckLevelAndSave2(i);
-		CheckLevelAndSave3(i);
-		CheckLevelAndSave4(i);
-		
-		// Notificamos individualmente al jugador
-		client_print_color(i, print_team_default, "^4%s ^1%L", pug_panama, i, "BPS_DATA_SAVE");
+		client_print_color(i, print_team_default, "^4%s ^1%L", pug_panama, i, "BPS_OFF_ID")
+	}
+}
+
+// ============================================================================
+// Forwards automaticos de compatibilidad con @PUG (inactivos si no hay PUG)
+// ============================================================================
+
+public pug_prestart(const _pug_fw_id[BPS_PUG_FORW_LEN])
+{
+	#pragma unused _pug_fw_id
+	g_bPugForwardLive = false
+	g_bPugMatchStartedLive = false
+	g_bWasLiveTracking = false
+	g_bRoundWasLive = false
+	g_bRoundHadValidTeams = false
+	g_bPugWinnerHandled = false
+
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		g_bPlayedActiveMatch[i] = false
+		if (is_user_connected(i) && !is_user_bot(i))
+			bps_players[i] = 15
+	}
+	return PLUGIN_CONTINUE
+}
+
+public pug_firsthalf(const _pug_fw_id[BPS_PUG_FORW_LEN])
+{
+	#pragma unused _pug_fw_id
+	g_bPugWinnerHandled = false
+	g_bPugForwardLive = true
+	return PLUGIN_CONTINUE
+}
+
+public pug_intermission(const _pug_fw_id[BPS_PUG_FORW_LEN])
+{
+	#pragma unused _pug_fw_id
+	g_bPugForwardLive = false
+	g_bWasLiveTracking = false
+	return PLUGIN_CONTINUE
+}
+
+public pug_ot_intermission(const _pug_fw_id[BPS_PUG_FORW_LEN])
+{
+	#pragma unused _pug_fw_id
+	g_bPugForwardLive = false
+	g_bWasLiveTracking = false
+	return PLUGIN_CONTINUE
+}
+
+public pug_secondhalf(const _pug_fw_id[BPS_PUG_FORW_LEN])
+{
+	#pragma unused _pug_fw_id
+	g_bPugForwardLive = true
+	return PLUGIN_CONTINUE
+}
+
+public pug_overtime(const _pug_fw_id[BPS_PUG_FORW_LEN])
+{
+	#pragma unused _pug_fw_id
+	g_bPugForwardLive = true
+	return PLUGIN_CONTINUE
+}
+
+public pug_round_start()
+{
+	CheckMatchLiveState()
+	return PLUGIN_CONTINUE
+}
+
+public pug_round_end(winner)
+{
+	if (!IsPugModeEnabled() || (!CheckMatchLiveState() && !g_bRoundWasLive))
+		return PLUGIN_CONTINUE
+
+	if (!g_bRoundEnded)
+	{
+		if (winner == 1)
+			HandleTeamRoundWin(CS_TEAM_T)
+		else if (winner == 2)
+			HandleTeamRoundWin(CS_TEAM_CT)
+
+		if (g_bPugWinnerHandled)
+		{
+			new Players[MAXPLAYERS], iNum
+			get_players(Players, iNum, "ch")
+			for (new idx = 0; idx < iNum; idx++)
+			{
+				FlushPlayerStats(Players[idx], true)
+			}
+		}
+	}
+	return PLUGIN_CONTINUE
+}
+
+public pug_winner(winner)
+{
+	if (g_bPugWinnerHandled || g_bMapEnding || !IsStatsActive() || !IsPugModeEnabled() || !g_bPugMatchStartedLive)
+		return PLUGIN_CONTINUE
+
+	g_bPugWinnerHandled = true
+
+	if (g_bRoundWasLive)
+	{
+		AwardRoundMultikills()
+	}
+
+	new Players[MAXPLAYERS], iNum, i
+	get_players(Players, iNum, "ch")
+	for (new idx = 0; idx < iNum; idx++)
+	{
+		i = Players[idx]
+		g_bPlayedActiveMatch[i] = false
+
+		new CsTeams:team = SafeGetUserTeam(i)
+		if (team != CS_TEAM_T && team != CS_TEAM_CT)
+			continue
+
+		if (!g_bLanBlocked[i] && g_iLoadedMask[i] == 15 && bps_players[i] == 1)
+		{
+			if (winner == 1)
+			{
+				if (team == CS_TEAM_T)
+				{
+					g_iStats[i][STAT_WIN] += 1
+					g_iStats[i][STAT_POINTS] += 10
+				}
+				else
+				{
+					g_iStats[i][STAT_LOS] += 1
+				}
+			}
+			else if (winner == 2)
+			{
+				if (team == CS_TEAM_CT)
+				{
+					g_iStats[i][STAT_WIN] += 1
+					g_iStats[i][STAT_POINTS] += 10
+				}
+				else
+				{
+					g_iStats[i][STAT_LOS] += 1
+				}
+			}
+			else
+			{
+				g_iStats[i][STAT_TIED] += 1
+				g_iStats[i][STAT_POINTS] += 3
+			}
+
+			FlushPlayerStats(i, true)
+		}
+	}
+
+	return PLUGIN_CONTINUE
+}
+
+public pug_finished()
+{
+	g_bPugForwardLive = false
+	g_bPugMatchStartedLive = false
+	g_bWasLiveTracking = false
+
+	// Si se cancelo la partida a mitad de ronda (.gg / .rmk / amx_cancelpug), descartar ronda inconclusa
+	if (!g_bPugWinnerHandled)
+	{
+		g_bRoundWasLive = false
+		g_bRoundHadValidTeams = false
+		for (new k = 1; k <= g_iMaxPlayers; k++)
+		{
+			g_iCurrentKills[k] = 0
+			g_iBestLifeKills[k] = 0
+			g_iRoundMkTier[k] = 0
+			g_iRoundDmg[k] = 0
+			g_bDiedInRound[k] = false
+			g_bUsedSecondLife[k] = false
+			bps_players_versus[k] = 0
+		}
+	}
+
+	for (new i = 1; i <= g_iMaxPlayers; i++)
+	{
+		g_bPlayedActiveMatch[i] = false
+		if (is_user_connected(i) && !is_user_bot(i) && !is_user_hltv(i))
+		{
+			FlushPlayerStats(i, true)
+			if (!g_bRoundWasLive)
+				bps_players[i] = 15
+		}
+	}
+
+	return PLUGIN_CONTINUE
+}
+
+stock GetEffectiveMaxNameLen()
+{
+	return clamp(get_pcvar_num(pcvarNameMaxLen), 1, BPS_MAX_NAME_LIMIT)
+}
+
+stock TruncatePlayerName(szStr[], iBufferMax, iMaxChars)
+{
+	if (iMaxChars <= 0 || iBufferMax <= 0)
+	{
+		szStr[0] = '^0'
+		return
+	}
+
+	new r = 0, w = 0, iChars = 0
+	new b0, b1, b2, b3
+
+	while (szStr[r] != '^0' && r < iBufferMax && iChars < iMaxChars)
+	{
+		b0 = szStr[r] & 0xFF
+
+		if (b0 < 0x80)
+		{
+			if (w + 1 > iBufferMax)
+				break
+			szStr[w++] = b0
+			r++
+			iChars++
+		}
+		else if (b0 >= 0xC2 && b0 <= 0xDF && r + 1 < iBufferMax)
+		{
+			b1 = szStr[r + 1] & 0xFF
+			if ((b1 & 0xC0) == 0x80)
+			{
+				if (w + 2 > iBufferMax)
+					break
+				szStr[w++] = b0
+				szStr[w++] = b1
+				r += 2
+				iChars++
+				continue
+			}
+			if (w + 1 > iBufferMax)
+				break
+			szStr[w++] = '?'
+			r++
+			iChars++
+		}
+		else if (b0 >= 0xE0 && b0 <= 0xEF && r + 2 < iBufferMax)
+		{
+			b1 = szStr[r + 1] & 0xFF
+			b2 = szStr[r + 2] & 0xFF
+			if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80
+				&& !(b0 == 0xE0 && b1 < 0xA0)
+				&& !(b0 == 0xED && b1 >= 0xA0))
+			{
+				if (w + 3 > iBufferMax)
+					break
+				szStr[w++] = b0
+				szStr[w++] = b1
+				szStr[w++] = b2
+				r += 3
+				iChars++
+				continue
+			}
+			if (w + 1 > iBufferMax)
+				break
+			szStr[w++] = '?'
+			r++
+			iChars++
+		}
+		else if (b0 >= 0xF0 && b0 <= 0xF4 && r + 3 < iBufferMax)
+		{
+			b1 = szStr[r + 1] & 0xFF
+			b2 = szStr[r + 2] & 0xFF
+			b3 = szStr[r + 3] & 0xFF
+			if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80
+				&& !(b0 == 0xF0 && b1 < 0x90)
+				&& !(b0 == 0xF4 && b1 > 0x8F))
+			{
+				if (w + 4 > iBufferMax)
+					break
+				szStr[w++] = b0
+				szStr[w++] = b1
+				szStr[w++] = b2
+				szStr[w++] = b3
+				r += 4
+				iChars++
+				continue
+			}
+			if (w + 1 > iBufferMax)
+				break
+			szStr[w++] = '?'
+			r++
+			iChars++
+		}
+		else
+		{
+			if (w + 1 > iBufferMax)
+				break
+			szStr[w++] = '?'
+			r++
+			iChars++
+		}
+	}
+
+	szStr[w] = '^0'
+}
+
+stock bool:IsPendingAuthID(const szAuthID[])
+{
+	if (!szAuthID[0])
+		return true
+	if (equali(szAuthID, "STEAM_ID_PENDING") || equali(szAuthID, "VALVE_ID_PENDING"))
+		return true
+	return false
+}
+
+stock bool:IsInvalidSteamAuthID(const szAuthID[])
+{
+	if (IsPendingAuthID(szAuthID))
+		return true
+	if (equali(szAuthID, "STEAM_ID_LAN") || equali(szAuthID, "VALVE_ID_LAN") || equali(szAuthID, "HLTV") || equali(szAuthID, "BOT"))
+		return true
+	return false
+}
+
+stock bool:ResolvePlayerIdentity(id)
+{
+	new iSaveType = get_pcvar_num(pcvarSaveType)
+	if (iSaveType == 0)
+		return false
+
+	static szRawAuth[35], szRawName[64], szTruncName[64]
+	get_user_authid(id, szRawAuth, charsmax(szRawAuth))
+	get_user_name(id, szRawName, charsmax(szRawName))
+
+	copy(szTruncName, charsmax(szTruncName), szRawName)
+	TruncatePlayerName(szTruncName, charsmax(szTruncName), GetEffectiveMaxNameLen())
+
+	if (get_pcvar_num(pcvarEnforceNameLen) && !equal(szRawName, szTruncName) && szTruncName[0])
+	{
+		set_user_info(id, "name", szTruncName)
+	}
+
+	SanitizeSQLField(szRawAuth, charsmax(szRawAuth))
+	SanitizeSQLField(szTruncName, charsmax(szTruncName))
+
+	copy(g_szAuthID[id], charsmax(g_szAuthID[]), szRawAuth)
+	copy(g_szName[id], charsmax(g_szName[]), szTruncName)
+
+	if (iSaveType == 2)
+	{
+		if (!g_szName[id][0])
+			return false
+		g_bUsingNameKey[id] = true
+		g_bLanBlocked[id] = false
+		formatex(g_szSaveKey[id], charsmax(g_szSaveKey[]), "N:%s", g_szName[id])
 	}
 	else
 	{
-		client_print_color(i, print_team_default, "^4%s ^1%L", pug_panama, i, "BPS_OFF_ID");
+		if (IsPendingAuthID(g_szAuthID[id]))
+			return false
+
+		if (IsInvalidSteamAuthID(g_szAuthID[id]))
+		{
+			g_bLanBlocked[id] = true
+			return false
+		}
+
+		g_bUsingNameKey[id] = false
+		g_bLanBlocked[id] = false
+		formatex(g_szSaveKey[id], charsmax(g_szSaveKey[]), "S:%s", g_szAuthID[id])
+	}
+
+	SanitizeSQLField(g_szSaveKey[id], charsmax(g_szSaveKey[]))
+	return true
+}
+
+stock bool:IsValidSqlIdentifier(const szIdent[])
+{
+	if (!szIdent[0])
+		return false
+
+	for (new i = 0; szIdent[i] != '^0'; i++)
+	{
+		new c = szIdent[i]
+		if (!(('a' <= c <= 'z') || ('A' <= c <= 'Z') || ('0' <= c <= '9') || c == '_'))
+			return false
+	}
+	return true
+}
+
+stock bool:IsValidServerId(const szId[])
+{
+	if (!szId[0])
+		return false
+
+	for (new i = 0; szId[i] != '^0'; i++)
+	{
+		new c = szId[i]
+		if (!(('a' <= c <= 'z') || ('A' <= c <= 'Z') || ('0' <= c <= '9') || c == '_' || c == '-'))
+			return false
+	}
+	return true
+}
+
+stock SanitizeSQLField( szString[ ], iLen )
+{
+	replace_all( szString, iLen, "'", "*" )
+	replace_all( szString, iLen, "^"", "*" )
+	replace_all( szString, iLen, "`", "*" )
+	replace_all( szString, iLen, "\", "" )
+	replace_all( szString, iLen, ";", "" )
+	replace_all( szString, iLen, "--", "-" )
+	replace_all( szString, iLen, "/*", "" )
+	replace_all( szString, iLen, "*/", "" )
+	replace_all( szString, iLen, "^r", "" )
+	replace_all( szString, iLen, "^n", "" )
+	replace_all( szString, iLen, "^t", " " )
+	replace_all( szString, iLen, "^x1a", "" )
+}
+
+stock GetWebLangCode( id, szOut[ ], iMaxLen )
+{
+	new szAmxLang[8]
+	if (id > 0 && is_user_connected(id))
+		get_user_info(id, "lang", szAmxLang, charsmax(szAmxLang))
+	if (!szAmxLang[0])
+		get_cvar_string("amx_language", szAmxLang, charsmax(szAmxLang))
+
+	if (equali(szAmxLang, "en"))
+		copy(szOut, iMaxLen, "en")
+	else if (equali(szAmxLang, "bp") || equali(szAmxLang, "pt"))
+		copy(szOut, iMaxLen, "pt")
+	else
+		copy(szOut, iMaxLen, "es")
+}
+
+stock BuildMotdTopUrl( id, szUrl[ ], iMaxLen )
+{
+	RefreshServerSettings()
+	get_pcvar_string(pcvarWebTop, szUrl, iMaxLen)
+	trim(szUrl)
+
+	new szLang[8]
+	GetWebLangCode(id, szLang, charsmax(szLang))
+
+	new iLen = strlen(szUrl)
+	iLen += formatex(szUrl[iLen], iMaxLen - iLen, "%slang=%s",
+		(contain(szUrl, "?") != -1) ? "&" : "?", szLang)
+
+	if (get_pcvar_num(pcvarMultiMode) == 1)
+	{
+		formatex(szUrl[iLen], iMaxLen - iLen, "&srv=%s", g_szEffectiveServerID)
 	}
 }
 
-public CheckLevelAndSave1( id ) {
-	
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "'", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "^"", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "`", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "´", "*" )
-	
-	new SQL_TABLE1[256]
-	get_cvar_string("bps_sql_db_1",SQL_TABLE1,256)
-	
-	new szTemp[512]
-	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET nick = '%s', \
-	skillpoints = '%i', \
-	level = '%i', \
-	pug_k = '%i', \
-	pug_d = '%i', \
-	pug_a = '%i', \
-	pug_bp = '%i', \
-	pug_bd = '%i', \
-	pug_adr = '%i', \
-	pug_hsp = '%i', \
-	pug_rws = '%i', \
-	pug_win = '%i', \
-	pug_los = '%i', \
-	pug_tied = '%i', \
-	pug_r_los = '%i', \
-	pug_rp = '%i' WHERE authid = '%s'", 
-	SQL_TABLE1, g_szName[ id ], 
-	g_szPoints[id], 
-	g_szLevels[id], 
-	g_szPoints_k[id], 
-	g_szPoints_d[id], 
-	g_szPoints_a[id], 
-	g_szPoints_bp[id], 
-	g_szPoints_bd[id], 
-	g_szPoints_adr[id], 
-	g_szPoints_hsp[id], 
-	g_szPoints_rws[id], 
-	g_szPoints_win[id], 
-	g_szPoints_los[id], 
-	g_szPoints_tied[id], 
-	g_szPoints_r_los[id], 
-	g_szPoints_rp[id], g_szAuthID[id] )
-	SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
-	// client_print(id, print_chat, "BPS - *Se Guardo los Datos #1* PASSE.!")
+stock bool:HasStatDelta(const cur[], const synced[], size, skipIdx = -1)
+{
+	for (new i = 0; i < size; i++)
+	{
+		if (i != skipIdx && cur[i] != synced[i])
+			return true
+	}
+	return false
 }
 
-public CheckLevelAndSave2( id ) {
-	
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "'", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "^"", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "`", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "´", "*" )
-	
-	new SQL_TABLE2[256]
-	get_cvar_string("bps_sql_db_2",SQL_TABLE2,256)
-	
-	new szTemp[512]
-	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET nick = '%s', \
-	pug_CSW_GLOCK18 = '%i', \
-	pug_CSW_USP = '%i', \
-	pug_CSW_P228 = '%i', \
-	pug_CSW_DEAGLE = '%i', \
-	pug_CSW_ELITE = '%i', \
-	pug_CSW_FIVESEVEN = '%i', \
-	pug_CSW_KNIFE = '%i', \
-	pug_CSW_HEGRENADE = '%i', \
-	pug_CSW_C4 = '%i' WHERE authid = '%s'", 
-	SQL_TABLE2, g_szName[ id ], 
-	g_szCSW_GLOCK18[ id ], 
-	g_szCSW_USP[ id ], 
-	g_szCSW_P228[ id ], 
-	g_szCSW_DEAGLE[ id ], 
-	g_szCSW_ELITE[ id ], 
-	g_szCSW_FIVESEVEN[ id ], 
-	g_szCSW_KNIFE[ id ], 
-	g_szCSW_HEGRENADE[ id ], 
-	g_szCSW_C4[ id ], g_szAuthID[id] )
+stock bool:CheckLevelAndSave1( id, bool:bRequireConnected = true ) {
+	if (!g_SqlTuple || !IsStatsActive() || !(g_iLoadedMask[id] & (1 << 0)) || !g_szSaveKey[id][0] || is_user_bot(id) || is_user_hltv(id))
+		return false
+	if (bRequireConnected && !is_user_connected(id))
+		return false
+
+	g_iStats[id][STAT_LEVEL] = max(0, g_iStats[id][STAT_POINTS] / 100)
+
+	if (!HasStatDelta(g_iStats[id], g_iStatsSynced[id], eMainStats, STAT_LEVEL))
+		return false
+
+	new dPts   = g_iStats[id][STAT_POINTS]  - g_iStatsSynced[id][STAT_POINTS]
+	new dKills = g_iStats[id][STAT_KILLS]   - g_iStatsSynced[id][STAT_KILLS]
+	new dDeath = g_iStats[id][STAT_DEATHS]  - g_iStatsSynced[id][STAT_DEATHS]
+	new dAst   = g_iStats[id][STAT_ASSISTS] - g_iStatsSynced[id][STAT_ASSISTS]
+	new dBp    = g_iStats[id][STAT_BP]      - g_iStatsSynced[id][STAT_BP]
+	new dBd    = g_iStats[id][STAT_BD]      - g_iStatsSynced[id][STAT_BD]
+	new dAdr   = g_iStats[id][STAT_ADR]     - g_iStatsSynced[id][STAT_ADR]
+	new dHsp   = g_iStats[id][STAT_HSP]     - g_iStatsSynced[id][STAT_HSP]
+	new dRws   = g_iStats[id][STAT_RWS]     - g_iStatsSynced[id][STAT_RWS]
+	new dWin   = g_iStats[id][STAT_WIN]     - g_iStatsSynced[id][STAT_WIN]
+	new dLos   = g_iStats[id][STAT_LOS]     - g_iStatsSynced[id][STAT_LOS]
+	new dTied  = g_iStats[id][STAT_TIED]    - g_iStatsSynced[id][STAT_TIED]
+	new dRLos  = g_iStats[id][STAT_RLOS]    - g_iStatsSynced[id][STAT_RLOS]
+	new dRp    = g_iStats[id][STAT_RP]      - g_iStatsSynced[id][STAT_RP]
+
+	static szTemp[1280]
+	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET authid = '%s', nick = '%s', last_server = '%s', \
+	skillpoints = GREATEST(0, skillpoints + (%i)), \
+	level = FLOOR(GREATEST(0, skillpoints) / 100), \
+	pug_k = GREATEST(0, pug_k + (%i)), \
+	pug_d = GREATEST(0, pug_d + (%i)), \
+	pug_a = GREATEST(0, pug_a + (%i)), \
+	pug_bp = GREATEST(0, pug_bp + (%i)), \
+	pug_bd = GREATEST(0, pug_bd + (%i)), \
+	pug_adr = GREATEST(0, pug_adr + (%i)), \
+	pug_hsp = GREATEST(0, pug_hsp + (%i)), \
+	pug_rws = GREATEST(0, pug_rws + (%i)), \
+	pug_win = GREATEST(0, pug_win + (%i)), \
+	pug_los = GREATEST(0, pug_los + (%i)), \
+	pug_tied = GREATEST(0, pug_tied + (%i)), \
+	pug_r_los = GREATEST(0, pug_r_los + (%i)), \
+	pug_rp = GREATEST(0, pug_rp + (%i)) WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE1, g_szAuthID[ id ], g_szName[ id ], g_szServerID,
+	dPts, dKills, dDeath, dAst, dBp, dBd, dAdr, dHsp, dRws, dWin, dLos, dTied, dRLos, dRp,
+	g_szEffectiveServerID, g_szSaveKey[id] )
+
 	SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
-	// client_print(id, print_chat, "BPS - *Se Guardo los Datos #2* PASSE.!")
+
+	for (new i = 0; i < eMainStats; i++)
+		g_iStatsSynced[id][i] = g_iStats[id][i]
+
+	return true
 }
 
-public CheckLevelAndSave3( id ) {
-	
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "'", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "^"", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "`", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "´", "*" )
-	
-	new SQL_TABLE3[256]
-	get_cvar_string("bps_sql_db_3",SQL_TABLE3,256)
-	
-	new szTemp[512]
-	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET nick = '%s', \
-	pug_CSW_M3 = '%i', \
-	pug_CSW_XM1014 = '%i', \
-	pug_CSW_TMP = '%i', \
-	pug_CSW_UMP45 = '%i', \
-	pug_CSW_MAC10 = '%i', \
-	pug_CSW_MP5NAVY = '%i', \
-	pug_CSW_P90 = '%i', \
-	pug_CSW_GALIL = '%i', \
-	pug_CSW_FAMAS = '%i', \
-	pug_CSW_AK47 = '%i', \
-	pug_CSW_M4A1 = '%i', \
-	pug_CSW_SCOUT = '%i', \
-	pug_CSW_SG552 = '%i', \
-	pug_CSW_AWP = '%i', \
-	pug_CSW_G3SG1 = '%i', \
-	pug_CSW_AUG = '%i', \
-	pug_CSW_SG550 = '%i', \
-	pug_CSW_M249 = '%i' WHERE authid = '%s'", 
-	SQL_TABLE3, g_szName[ id ], 
-	g_szCSW_M3[ id ], 
-	g_szCSW_XM1014[ id ], 
-	g_szCSW_TMP[ id ], 
-	g_szCSW_UMP45[ id ], 
-	g_szCSW_MAC10[ id ], 
-	g_szCSW_MP5NAVY[ id ], 
-	g_szCSW_P90[ id ], 
-	g_szCSW_GALIL[ id ], 
-	g_szCSW_FAMAS[ id ], 
-	g_szCSW_AK47[ id ], 
-	g_szCSW_M4A1[ id ], 
-	g_szCSW_SCOUT[ id ], 
-	g_szCSW_SG552[ id ], 
-	g_szCSW_AWP[ id ], 
-	g_szCSW_G3SG1[ id ], 
-	g_szCSW_AUG[ id ], 
-	g_szCSW_SG550[ id ], 
-	g_szCSW_M249[ id ], g_szAuthID[id] )
+stock bool:CheckLevelAndSave2( id, bool:bRequireConnected = true ) {
+	if (!g_SqlTuple || !IsStatsActive() || !(g_iLoadedMask[id] & (1 << 1)) || !g_szSaveKey[id][0] || is_user_bot(id) || is_user_hltv(id))
+		return false
+	if (bRequireConnected && !is_user_connected(id))
+		return false
+
+	if (!HasStatDelta(g_iWep1[id], g_iWep1Synced[id], eWep1Stats))
+		return false
+
+	static szTemp[1024]
+	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET authid = '%s', nick = '%s', \
+	pug_CSW_GLOCK18 = GREATEST(0, pug_CSW_GLOCK18 + (%i)), \
+	pug_CSW_USP = GREATEST(0, pug_CSW_USP + (%i)), \
+	pug_CSW_P228 = GREATEST(0, pug_CSW_P228 + (%i)), \
+	pug_CSW_DEAGLE = GREATEST(0, pug_CSW_DEAGLE + (%i)), \
+	pug_CSW_ELITE = GREATEST(0, pug_CSW_ELITE + (%i)), \
+	pug_CSW_FIVESEVEN = GREATEST(0, pug_CSW_FIVESEVEN + (%i)), \
+	pug_CSW_KNIFE = GREATEST(0, pug_CSW_KNIFE + (%i)), \
+	pug_CSW_HEGRENADE = GREATEST(0, pug_CSW_HEGRENADE + (%i)), \
+	pug_CSW_C4 = GREATEST(0, pug_CSW_C4 + (%i)) WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE2, g_szAuthID[ id ], g_szName[ id ],
+	g_iWep1[id][W1_GLOCK18] - g_iWep1Synced[id][W1_GLOCK18],
+	g_iWep1[id][W1_USP] - g_iWep1Synced[id][W1_USP],
+	g_iWep1[id][W1_P228] - g_iWep1Synced[id][W1_P228],
+	g_iWep1[id][W1_DEAGLE] - g_iWep1Synced[id][W1_DEAGLE],
+	g_iWep1[id][W1_ELITE] - g_iWep1Synced[id][W1_ELITE],
+	g_iWep1[id][W1_FIVESEVEN] - g_iWep1Synced[id][W1_FIVESEVEN],
+	g_iWep1[id][W1_KNIFE] - g_iWep1Synced[id][W1_KNIFE],
+	g_iWep1[id][W1_HEGRENADE] - g_iWep1Synced[id][W1_HEGRENADE],
+	g_iWep1[id][W1_C4] - g_iWep1Synced[id][W1_C4],
+	g_szEffectiveServerID, g_szSaveKey[id] )
+
 	SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
-	// client_print(id, print_chat, "BPS - *Se Guardo los Datos #3* PASSE.!")
+
+	for (new i = 0; i < eWep1Stats; i++)
+		g_iWep1Synced[id][i] = g_iWep1[id][i]
+
+	return true
 }
 
-public CheckLevelAndSave4( id ) {
-	
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "'", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "^"", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "`", "*" )
-	replace_all( g_szName[ id ], charsmax( g_szName[ ] ), "´", "*" )
-	
-	new SQL_TABLE4[256]
-	get_cvar_string("bps_sql_db_4",SQL_TABLE4,256)
-	
-	new szTemp[512]
-	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET nick = '%s', \
-	pug_2k = '%i', \
-	pug_3k = '%i', \
-	pug_4k = '%i', \
-	pug_5k = '%i', \
-	pug_v1 = '%i', \
-	pug_v2 = '%i', \
-	pug_v3 = '%i', \
-	pug_v4 = '%i', \
-	pug_v5 = '%i' WHERE authid = '%s'", 
-	SQL_TABLE4, g_szName[ id ], 
-	g_szPoints_2k[id], 
-	g_szPoints_3k[id], 
-	g_szPoints_4k[id], 
-	g_szPoints_5k[id], 
-	g_szPoints_v1[id], 
-	g_szPoints_v2[id], 
-	g_szPoints_v3[id], 
-	g_szPoints_v4[id], 
-	g_szPoints_v5[id], g_szAuthID[id] )
+stock bool:CheckLevelAndSave3( id, bool:bRequireConnected = true ) {
+	if (!g_SqlTuple || !IsStatsActive() || !(g_iLoadedMask[id] & (1 << 2)) || !g_szSaveKey[id][0] || is_user_bot(id) || is_user_hltv(id))
+		return false
+	if (bRequireConnected && !is_user_connected(id))
+		return false
+
+	if (!HasStatDelta(g_iWep2[id], g_iWep2Synced[id], eWep2Stats))
+		return false
+
+	static szTemp[1280]
+	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET authid = '%s', nick = '%s', \
+	pug_CSW_M3 = GREATEST(0, pug_CSW_M3 + (%i)), \
+	pug_CSW_XM1014 = GREATEST(0, pug_CSW_XM1014 + (%i)), \
+	pug_CSW_TMP = GREATEST(0, pug_CSW_TMP + (%i)), \
+	pug_CSW_UMP45 = GREATEST(0, pug_CSW_UMP45 + (%i)), \
+	pug_CSW_MAC10 = GREATEST(0, pug_CSW_MAC10 + (%i)), \
+	pug_CSW_MP5NAVY = GREATEST(0, pug_CSW_MP5NAVY + (%i)), \
+	pug_CSW_P90 = GREATEST(0, pug_CSW_P90 + (%i)), \
+	pug_CSW_GALIL = GREATEST(0, pug_CSW_GALIL + (%i)), \
+	pug_CSW_FAMAS = GREATEST(0, pug_CSW_FAMAS + (%i)), \
+	pug_CSW_AK47 = GREATEST(0, pug_CSW_AK47 + (%i)), \
+	pug_CSW_M4A1 = GREATEST(0, pug_CSW_M4A1 + (%i)), \
+	pug_CSW_SCOUT = GREATEST(0, pug_CSW_SCOUT + (%i)), \
+	pug_CSW_SG552 = GREATEST(0, pug_CSW_SG552 + (%i)), \
+	pug_CSW_AWP = GREATEST(0, pug_CSW_AWP + (%i)), \
+	pug_CSW_G3SG1 = GREATEST(0, pug_CSW_G3SG1 + (%i)), \
+	pug_CSW_AUG = GREATEST(0, pug_CSW_AUG + (%i)), \
+	pug_CSW_SG550 = GREATEST(0, pug_CSW_SG550 + (%i)), \
+	pug_CSW_M249 = GREATEST(0, pug_CSW_M249 + (%i)) WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE3, g_szAuthID[ id ], g_szName[ id ],
+	g_iWep2[id][W2_M3] - g_iWep2Synced[id][W2_M3],
+	g_iWep2[id][W2_XM1014] - g_iWep2Synced[id][W2_XM1014],
+	g_iWep2[id][W2_TMP] - g_iWep2Synced[id][W2_TMP],
+	g_iWep2[id][W2_UMP45] - g_iWep2Synced[id][W2_UMP45],
+	g_iWep2[id][W2_MAC10] - g_iWep2Synced[id][W2_MAC10],
+	g_iWep2[id][W2_MP5NAVY] - g_iWep2Synced[id][W2_MP5NAVY],
+	g_iWep2[id][W2_P90] - g_iWep2Synced[id][W2_P90],
+	g_iWep2[id][W2_GALIL] - g_iWep2Synced[id][W2_GALIL],
+	g_iWep2[id][W2_FAMAS] - g_iWep2Synced[id][W2_FAMAS],
+	g_iWep2[id][W2_AK47] - g_iWep2Synced[id][W2_AK47],
+	g_iWep2[id][W2_M4A1] - g_iWep2Synced[id][W2_M4A1],
+	g_iWep2[id][W2_SCOUT] - g_iWep2Synced[id][W2_SCOUT],
+	g_iWep2[id][W2_SG552] - g_iWep2Synced[id][W2_SG552],
+	g_iWep2[id][W2_AWP] - g_iWep2Synced[id][W2_AWP],
+	g_iWep2[id][W2_G3SG1] - g_iWep2Synced[id][W2_G3SG1],
+	g_iWep2[id][W2_AUG] - g_iWep2Synced[id][W2_AUG],
+	g_iWep2[id][W2_SG550] - g_iWep2Synced[id][W2_SG550],
+	g_iWep2[id][W2_M249] - g_iWep2Synced[id][W2_M249],
+	g_szEffectiveServerID, g_szSaveKey[id] )
+
 	SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
-	// client_print(id, print_chat, "BPS - *Se Guardo los Datos #4* PASSE.!")
+
+	for (new i = 0; i < eWep2Stats; i++)
+		g_iWep2Synced[id][i] = g_iWep2[id][i]
+
+	return true
+}
+
+stock bool:CheckLevelAndSave4( id, bool:bRequireConnected = true ) {
+	if (!g_SqlTuple || !IsStatsActive() || !(g_iLoadedMask[id] & (1 << 3)) || !g_szSaveKey[id][0] || is_user_bot(id) || is_user_hltv(id))
+		return false
+	if (bRequireConnected && !is_user_connected(id))
+		return false
+
+	if (!HasStatDelta(g_iVersus[id], g_iVersusSynced[id], eVersusStats))
+		return false
+
+	static szTemp[1024]
+	formatex( szTemp, charsmax( szTemp ), "UPDATE %s SET authid = '%s', nick = '%s', \
+	pug_2k = GREATEST(0, pug_2k + (%i)), \
+	pug_3k = GREATEST(0, pug_3k + (%i)), \
+	pug_4k = GREATEST(0, pug_4k + (%i)), \
+	pug_5k = GREATEST(0, pug_5k + (%i)), \
+	pug_v1 = GREATEST(0, pug_v1 + (%i)), \
+	pug_v2 = GREATEST(0, pug_v2 + (%i)), \
+	pug_v3 = GREATEST(0, pug_v3 + (%i)), \
+	pug_v4 = GREATEST(0, pug_v4 + (%i)), \
+	pug_v5 = GREATEST(0, pug_v5 + (%i)) WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE4, g_szAuthID[ id ], g_szName[ id ],
+	g_iVersus[id][VS_2K] - g_iVersusSynced[id][VS_2K],
+	g_iVersus[id][VS_3K] - g_iVersusSynced[id][VS_3K],
+	g_iVersus[id][VS_4K] - g_iVersusSynced[id][VS_4K],
+	g_iVersus[id][VS_5K] - g_iVersusSynced[id][VS_5K],
+	g_iVersus[id][VS_V1] - g_iVersusSynced[id][VS_V1],
+	g_iVersus[id][VS_V2] - g_iVersusSynced[id][VS_V2],
+	g_iVersus[id][VS_V3] - g_iVersusSynced[id][VS_V3],
+	g_iVersus[id][VS_V4] - g_iVersusSynced[id][VS_V4],
+	g_iVersus[id][VS_V5] - g_iVersusSynced[id][VS_V5],
+	g_szEffectiveServerID, g_szSaveKey[id] )
+
+	SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
+
+	for (new i = 0; i < eVersusStats; i++)
+		g_iVersusSynced[id][i] = g_iVersus[id][i]
+
+	return true
 }
 
 public LoadPoints1( id ) {
-	new Data[ 1 ]
+	if (!g_SqlTuple || !IsStatsActive() || !g_szSaveKey[id][0] || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	new Data[ 3 ]
 	Data[ 0 ] = id
-	
-	new SQL_TABLE1[256]
-	get_cvar_string("bps_sql_db_1",SQL_TABLE1,256)
-	
-	new szTemp[512]
-	format( szTemp, charsmax( szTemp ), 
-	"SELECT skillpoints, \
-	level, \
-	pug_k, \
-	pug_d, \
-	pug_a, \
-	pug_bp, \
-	pug_bd, \
-	pug_adr, \
-	pug_hsp, \
-	pug_rws, \
-	pug_win, \
-	pug_los, \
-	pug_tied, \
-	pug_r_los, \
-	pug_rp FROM %s WHERE authid = '%s'", 
-	SQL_TABLE1, g_szAuthID[ id ] )
-	SQL_ThreadQuery( g_SqlTuple, "RegisterClient1", szTemp, Data, 1 )
+	Data[ 1 ] = get_user_userid( id )
+	Data[ 2 ] = g_iLoadSeq[ id ]
+
+	static szTemp[512]
+	formatex( szTemp, charsmax( szTemp ),
+	"SELECT skillpoints, level, pug_k, pug_d, pug_a, pug_bp, pug_bd, pug_adr, pug_hsp, pug_rws, pug_win, pug_los, pug_tied, pug_r_los, pug_rp \
+	FROM %s WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE1, g_szEffectiveServerID, g_szSaveKey[ id ] )
+	SQL_ThreadQuery( g_SqlTuple, "RegisterClient1", szTemp, Data, 3 )
 }
 
 public LoadPoints2( id ) {
-	new Data[ 1 ]
+	if (!g_SqlTuple || !IsStatsActive() || !g_szSaveKey[id][0] || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	new Data[ 3 ]
 	Data[ 0 ] = id
-	
-	new SQL_TABLE2[256]
-	get_cvar_string("bps_sql_db_2",SQL_TABLE2,256)
-	
-	new szTemp[512]
-	format( szTemp, charsmax( szTemp ), 
-	"SELECT pug_CSW_GLOCK18, \
-	pug_CSW_USP, \
-	pug_CSW_P228, \
-	pug_CSW_DEAGLE, \
-	pug_CSW_ELITE, \
-	pug_CSW_FIVESEVEN, \
-	pug_CSW_KNIFE, \
-	pug_CSW_HEGRENADE, \
-	pug_CSW_C4 FROM %s WHERE authid = '%s'", 
-	SQL_TABLE2, g_szAuthID[ id ] )
-	SQL_ThreadQuery( g_SqlTuple, "RegisterClient2", szTemp, Data, 1 )
+	Data[ 1 ] = get_user_userid( id )
+	Data[ 2 ] = g_iLoadSeq[ id ]
+
+	static szTemp[512]
+	formatex( szTemp, charsmax( szTemp ),
+	"SELECT pug_CSW_GLOCK18, pug_CSW_USP, pug_CSW_P228, pug_CSW_DEAGLE, pug_CSW_ELITE, pug_CSW_FIVESEVEN, pug_CSW_KNIFE, pug_CSW_HEGRENADE, pug_CSW_C4 \
+	FROM %s WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE2, g_szEffectiveServerID, g_szSaveKey[ id ] )
+	SQL_ThreadQuery( g_SqlTuple, "RegisterClient2", szTemp, Data, 3 )
 }
 
 public LoadPoints3( id ) {
-	new Data[ 1 ]
+	if (!g_SqlTuple || !IsStatsActive() || !g_szSaveKey[id][0] || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	new Data[ 3 ]
 	Data[ 0 ] = id
-	
-	new SQL_TABLE3[256]
-	get_cvar_string("bps_sql_db_3",SQL_TABLE3,256)
-	
-	new szTemp[512]
-	format( szTemp, charsmax( szTemp ), 
-	"SELECT pug_CSW_M3, \
-	pug_CSW_XM1014, \
-	pug_CSW_TMP, \
-	pug_CSW_UMP45, \
-	pug_CSW_MAC10, \
-	pug_CSW_MP5NAVY, \
-	pug_CSW_P90, \
-	pug_CSW_GALIL, \
-	pug_CSW_FAMAS, \
-	pug_CSW_AK47, \
-	pug_CSW_M4A1, \
-	pug_CSW_SCOUT, \
-	pug_CSW_SG552, \
-	pug_CSW_AWP, \
-	pug_CSW_G3SG1, \
-	pug_CSW_AUG, \
-	pug_CSW_SG550, \
-	pug_CSW_M249 FROM %s WHERE authid = '%s'", 
-	SQL_TABLE3, g_szAuthID[ id ] )
-	SQL_ThreadQuery( g_SqlTuple, "RegisterClient3", szTemp, Data, 1 )
+	Data[ 1 ] = get_user_userid( id )
+	Data[ 2 ] = g_iLoadSeq[ id ]
+
+	static szTemp[512]
+	formatex( szTemp, charsmax( szTemp ),
+	"SELECT pug_CSW_M3, pug_CSW_XM1014, pug_CSW_TMP, pug_CSW_UMP45, pug_CSW_MAC10, pug_CSW_MP5NAVY, pug_CSW_P90, pug_CSW_GALIL, pug_CSW_FAMAS, pug_CSW_AK47, \
+	pug_CSW_M4A1, pug_CSW_SCOUT, pug_CSW_SG552, pug_CSW_AWP, pug_CSW_G3SG1, pug_CSW_AUG, pug_CSW_SG550, pug_CSW_M249 \
+	FROM %s WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE3, g_szEffectiveServerID, g_szSaveKey[ id ] )
+	SQL_ThreadQuery( g_SqlTuple, "RegisterClient3", szTemp, Data, 3 )
 }
 
 public LoadPoints4(id) {
-	new Data[ 1 ]
+	if (!g_SqlTuple || !IsStatsActive() || !g_szSaveKey[id][0] || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	new Data[ 3 ]
 	Data[ 0 ] = id
-	
-	new SQL_TABLE4[256]
-	get_cvar_string("bps_sql_db_4",SQL_TABLE4,256)
-	
-	new szTemp[512]
-	format( szTemp, charsmax( szTemp ), 
-	"SELECT pug_2k, \
-	pug_3k, \
-	pug_4k, \
-	pug_5k, \
-	pug_v1, \
-	pug_v2, \
-	pug_v3, \
-	pug_v4, \
-	pug_v5 FROM %s WHERE authid = '%s'", 
-	SQL_TABLE4, g_szAuthID[ id ] )
-	SQL_ThreadQuery( g_SqlTuple, "RegisterClient4", szTemp, Data, 1 )
+	Data[ 1 ] = get_user_userid( id )
+	Data[ 2 ] = g_iLoadSeq[ id ]
+
+	static szTemp[512]
+	formatex( szTemp, charsmax( szTemp ),
+	"SELECT pug_2k, pug_3k, pug_4k, pug_5k, pug_v1, pug_v2, pug_v3, pug_v4, pug_v5 \
+	FROM %s WHERE server_id = '%s' AND save_key = '%s'",
+	SQL_TABLE4, g_szEffectiveServerID, g_szSaveKey[ id ] )
+	SQL_ThreadQuery( g_SqlTuple, "RegisterClient4", szTemp, Data, 3 )
 }
 
 public RegisterClient1( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
 {
-	new id
-	id = Data[ 0 ]
-	new SQL_TABLE1[256]
-	
-	g_szPoints[ id ] = 0
-	g_szLevels[ id ] = 0
-	g_szPoints_k[ id ] = 0
-	g_szPoints_d[ id ] = 0
-	g_szPoints_a[ id ] = 0
-	g_szPoints_bp[ id ] = 0
-	g_szPoints_bd[ id ] = 0
-	g_szPoints_adr[ id ] = 0
-	g_szPoints_hsp[ id ] = 0
-	g_szPoints_rws[ id ] = 0
-	g_szPoints_win[ id ] = 0
-	g_szPoints_los[ id ] = 0
-	g_szPoints_tied[ id ] = 0
-	g_szPoints_r_los[ id ] = 0
-	g_szPoints_rp[ id ] = 0
-	
-	get_cvar_string("bps_sql_db_1",SQL_TABLE1,256)
+	new id = Data[ 0 ]
+	if (!is_user_connected(id) || get_user_userid(id) != Data[ 1 ] || g_iLoadSeq[id] != Data[ 2 ])
+		return
+
 	if( !SQL_IsFail( FailState, Errcode, Error ) )
 	{
 		if( SQL_NumResults( Query ) < 1 )
 		{
-			new szTemp[ 512 ]
-			format( szTemp, charsmax( szTemp ), "INSERT INTO %s \
-			(authid, nick, skillpoints, level, pug_k, pug_d, pug_a, pug_bp,  pug_bd, pug_adr, pug_hsp, pug_rws, pug_win, pug_los, pug_tied, pug_r_los, pug_rp ) \
-			VALUES( '%s', '%s', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i' )", 
-			SQL_TABLE1, g_szAuthID[id], g_szName[id], 
-			g_szPoints[id], 
-			g_szLevels[id], 
-			g_szPoints_k[id], 
-			g_szPoints_d[id], 
-			g_szPoints_a[id], 
-			g_szPoints_bp[id], 
-			g_szPoints_bd[id], 
-			g_szPoints_adr[id], 
-			g_szPoints_hsp[id], 
-			g_szPoints_rws[id], 
-			g_szPoints_win[id], 
-			g_szPoints_los[id], 
-			g_szPoints_tied[id], 
-			g_szPoints_r_los[id], 
-			g_szPoints_rp[id] )
+			arrayset(g_iStats[id], 0, eMainStats)
+			arrayset(g_iStatsSynced[id], 0, eMainStats)
+
+			static szTemp[ 1024 ]
+			formatex( szTemp, charsmax( szTemp ), "INSERT INTO %s \
+			(server_id, save_key, authid, nick, last_server, skillpoints, level, pug_k, pug_d, pug_a, pug_bp, pug_bd, pug_adr, pug_hsp, pug_rws, pug_win, pug_los, pug_tied, pug_r_los, pug_rp ) \
+			VALUES( '%s', '%s', '%s', '%s', '%s', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ) \
+			ON DUPLICATE KEY UPDATE authid = VALUES(authid), nick = VALUES(nick), last_server = VALUES(last_server)",
+			SQL_TABLE1, g_szEffectiveServerID, g_szSaveKey[id], g_szAuthID[id], g_szName[id], g_szServerID )
 			SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
 		}
 		else
 		{
-			g_szPoints[ id ] = SQL_ReadResult( Query, 0 )
-			g_szLevels[ id ] = SQL_ReadResult( Query, 1 )
-			g_szPoints_k[ id ] = SQL_ReadResult( Query, 2 )
-			g_szPoints_d[ id ] = SQL_ReadResult( Query, 3 )
-			g_szPoints_a[ id ] = SQL_ReadResult( Query, 4 )
-			g_szPoints_bp[ id ] = SQL_ReadResult( Query, 5 )
-			g_szPoints_bd[ id ] = SQL_ReadResult( Query, 6 )
-			g_szPoints_adr[ id ] = SQL_ReadResult( Query, 7 )
-			g_szPoints_hsp[ id ] = SQL_ReadResult( Query, 8 )
-			g_szPoints_rws[ id ] = SQL_ReadResult( Query, 9 )
-			g_szPoints_win[ id ] = SQL_ReadResult( Query, 10 )
-			g_szPoints_los[ id ] = SQL_ReadResult( Query, 11 )
-			g_szPoints_tied[ id ] = SQL_ReadResult( Query, 12 )
-			g_szPoints_r_los[ id ] = SQL_ReadResult( Query, 13 )
-			g_szPoints_rp[ id ] = SQL_ReadResult( Query, 14 )
+			for (new i = 0; i < eMainStats; i++)
+			{
+				g_iStats[id][i] = SQL_ReadResult(Query, i)
+				g_iStatsSynced[id][i] = g_iStats[id][i]
+			}
 		}
+
+		g_iLoadedMask[id] |= (1 << 0)
+		if (g_iLoadedMask[id] == 15)
+			Test_bps_players(id)
+	}
+	else
+	{
+		ScheduleLoadRetry(id)
 	}
 }
 
 public RegisterClient2( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
 {
-	new id
-	id = Data[ 0 ]
-	new SQL_TABLE2[256]
-	
-	g_szCSW_GLOCK18[id] = 0
-	g_szCSW_USP[id] = 0
-	g_szCSW_P228[id] = 0
-	g_szCSW_DEAGLE[id] = 0
-	g_szCSW_ELITE[id] = 0
-	g_szCSW_FIVESEVEN[id] = 0
-	g_szCSW_KNIFE[id] = 0
-	g_szCSW_HEGRENADE[id] = 0
-	g_szCSW_C4[id] = 0
-	
-	get_cvar_string("bps_sql_db_2",SQL_TABLE2,256)
+	new id = Data[ 0 ]
+	if (!is_user_connected(id) || get_user_userid(id) != Data[ 1 ] || g_iLoadSeq[id] != Data[ 2 ])
+		return
+
 	if( !SQL_IsFail( FailState, Errcode, Error ) )
 	{
 		if( SQL_NumResults( Query ) < 1 )
 		{
-			new szTemp[ 512 ]
-			format( szTemp, charsmax( szTemp ), "INSERT INTO %s \
-			(authid, nick, pug_CSW_GLOCK18, pug_CSW_USP, pug_CSW_P228, pug_CSW_DEAGLE, pug_CSW_ELITE, pug_CSW_FIVESEVEN, pug_CSW_KNIFE, pug_CSW_HEGRENADE, pug_CSW_C4) \
-			VALUES( '%s', '%s', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i' )", 
-			SQL_TABLE2, g_szAuthID[id], g_szName[id], 
-			g_szCSW_GLOCK18[id], 
-			g_szCSW_USP[id], 
-			g_szCSW_P228[id], 
-			g_szCSW_DEAGLE[id], 
-			g_szCSW_ELITE[id], 
-			g_szCSW_FIVESEVEN[id], 
-			g_szCSW_KNIFE[id], 
-			g_szCSW_HEGRENADE[id], 
-			g_szCSW_C4[id] )
+			arrayset(g_iWep1[id], 0, eWep1Stats)
+			arrayset(g_iWep1Synced[id], 0, eWep1Stats)
+
+			static szTemp[ 1024 ]
+			formatex( szTemp, charsmax( szTemp ), "INSERT INTO %s \
+			(server_id, save_key, authid, nick, pug_CSW_GLOCK18, pug_CSW_USP, pug_CSW_P228, pug_CSW_DEAGLE, pug_CSW_ELITE, pug_CSW_FIVESEVEN, pug_CSW_KNIFE, pug_CSW_HEGRENADE, pug_CSW_C4) \
+			VALUES( '%s', '%s', '%s', '%s', 0, 0, 0, 0, 0, 0, 0, 0, 0 ) \
+			ON DUPLICATE KEY UPDATE authid = VALUES(authid), nick = VALUES(nick)",
+			SQL_TABLE2, g_szEffectiveServerID, g_szSaveKey[id], g_szAuthID[id], g_szName[id] )
 			SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
 		}
 		else
 		{
-			g_szCSW_GLOCK18[id] = SQL_ReadResult( Query, 0 )
-			g_szCSW_USP[id] = SQL_ReadResult( Query, 1 )
-			g_szCSW_P228[id] = SQL_ReadResult( Query, 2 )
-			g_szCSW_DEAGLE[id] = SQL_ReadResult( Query, 3 )
-			g_szCSW_ELITE[id] = SQL_ReadResult( Query, 4 )
-			g_szCSW_FIVESEVEN[id] = SQL_ReadResult( Query, 5 )
-			g_szCSW_KNIFE[id] = SQL_ReadResult( Query, 6 )
-			g_szCSW_HEGRENADE[id] = SQL_ReadResult( Query, 7 )
-			g_szCSW_C4[id] = SQL_ReadResult( Query, 8 )
+			for (new i = 0; i < eWep1Stats; i++)
+			{
+				g_iWep1[id][i] = SQL_ReadResult(Query, i)
+				g_iWep1Synced[id][i] = g_iWep1[id][i]
+			}
 		}
+
+		g_iLoadedMask[id] |= (1 << 1)
+		if (g_iLoadedMask[id] == 15)
+			Test_bps_players(id)
+	}
+	else
+	{
+		ScheduleLoadRetry(id)
 	}
 }
 
 public RegisterClient3( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
 {
-	new id
-	id = Data[ 0 ]
-	new SQL_TABLE3[256]
-	
-	g_szCSW_M3[id] = 0
-	g_szCSW_XM1014[id] = 0
-	g_szCSW_TMP[id] = 0
-	g_szCSW_UMP45[id] = 0
-	g_szCSW_MAC10[id] = 0
-	g_szCSW_MP5NAVY[id] = 0
-	g_szCSW_P90[id] = 0
-	g_szCSW_GALIL[id] = 0
-	g_szCSW_FAMAS[id] = 0
-	g_szCSW_AK47[id] = 0
-	g_szCSW_M4A1[id] = 0
-	g_szCSW_SCOUT[id] = 0
-	g_szCSW_SG552[id] = 0
-	g_szCSW_AWP[id] = 0
-	g_szCSW_G3SG1[id] = 0
-	g_szCSW_AUG[id] = 0
-	g_szCSW_SG550[id] = 0
-	g_szCSW_M249[id] = 0
-	
-	get_cvar_string("bps_sql_db_3",SQL_TABLE3,256)
+	new id = Data[ 0 ]
+	if (!is_user_connected(id) || get_user_userid(id) != Data[ 1 ] || g_iLoadSeq[id] != Data[ 2 ])
+		return
+
 	if( !SQL_IsFail( FailState, Errcode, Error ) )
 	{
 		if( SQL_NumResults( Query ) < 1 )
 		{
-			new szTemp[ 512 ]
-			format( szTemp, charsmax( szTemp ), "INSERT INTO %s \
-			(authid, nick, pug_CSW_M3, pug_CSW_XM1014, pug_CSW_TMP, pug_CSW_UMP45, pug_CSW_MAC10, pug_CSW_MP5NAVY, pug_CSW_P90, \
+			arrayset(g_iWep2[id], 0, eWep2Stats)
+			arrayset(g_iWep2Synced[id], 0, eWep2Stats)
+
+			static szTemp[ 1024 ]
+			formatex( szTemp, charsmax( szTemp ), "INSERT INTO %s \
+			(server_id, save_key, authid, nick, pug_CSW_M3, pug_CSW_XM1014, pug_CSW_TMP, pug_CSW_UMP45, pug_CSW_MAC10, pug_CSW_MP5NAVY, pug_CSW_P90, \
 			pug_CSW_GALIL, pug_CSW_FAMAS, pug_CSW_AK47, pug_CSW_M4A1, pug_CSW_SCOUT, pug_CSW_SG552, pug_CSW_AWP, pug_CSW_G3SG1, pug_CSW_AUG, pug_CSW_SG550, pug_CSW_M249 ) \
-			VALUES( '%s', '%s', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i' )", 
-			SQL_TABLE3, g_szAuthID[id], g_szName[id], 
-			g_szCSW_M3[id], 
-			g_szCSW_XM1014[id], 
-			g_szCSW_TMP[id], 
-			g_szCSW_UMP45[id], 
-			g_szCSW_MAC10[id], 
-			g_szCSW_MP5NAVY[id], 
-			g_szCSW_P90[id], 
-			g_szCSW_GALIL[id], 
-			g_szCSW_FAMAS[id], 
-			g_szCSW_AK47[id], 
-			g_szCSW_M4A1[id], 
-			g_szCSW_SCOUT[id], 
-			g_szCSW_SG552[id], 
-			g_szCSW_AWP[id], 
-			g_szCSW_G3SG1[id], 
-			g_szCSW_AUG[id], 
-			g_szCSW_SG550[id], 
-			g_szCSW_M249[id] )
+			VALUES( '%s', '%s', '%s', '%s', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ) \
+			ON DUPLICATE KEY UPDATE authid = VALUES(authid), nick = VALUES(nick)",
+			SQL_TABLE3, g_szEffectiveServerID, g_szSaveKey[id], g_szAuthID[id], g_szName[id] )
 			SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
 		}
 		else
 		{
-			g_szCSW_M3[id] = SQL_ReadResult( Query, 0 )
-			g_szCSW_XM1014[id] = SQL_ReadResult( Query, 1 )
-			g_szCSW_TMP[id] = SQL_ReadResult( Query, 2 )
-			g_szCSW_UMP45[id] = SQL_ReadResult( Query, 3 )
-			g_szCSW_MAC10[id] = SQL_ReadResult( Query, 4 )
-			g_szCSW_MP5NAVY[id] = SQL_ReadResult( Query, 5 )
-			g_szCSW_P90[id] = SQL_ReadResult( Query, 6 )
-			g_szCSW_GALIL[id] = SQL_ReadResult( Query, 7 )
-			g_szCSW_FAMAS[id] = SQL_ReadResult( Query, 8 )
-			g_szCSW_AK47[id] = SQL_ReadResult( Query, 9 )
-			g_szCSW_M4A1[id] = SQL_ReadResult( Query, 10 )
-			g_szCSW_SCOUT[id] = SQL_ReadResult( Query, 11 )
-			g_szCSW_SG552[id] = SQL_ReadResult( Query, 12 )
-			g_szCSW_AWP[id] = SQL_ReadResult( Query, 13 )
-			g_szCSW_G3SG1[id] = SQL_ReadResult( Query, 14 )
-			g_szCSW_AUG[id] = SQL_ReadResult( Query, 15 )
-			g_szCSW_SG550[id] = SQL_ReadResult( Query, 16 )
-			g_szCSW_M249[id] = SQL_ReadResult( Query, 17 )
+			for (new i = 0; i < eWep2Stats; i++)
+			{
+				g_iWep2[id][i] = SQL_ReadResult(Query, i)
+				g_iWep2Synced[id][i] = g_iWep2[id][i]
+			}
 		}
+
+		g_iLoadedMask[id] |= (1 << 2)
+		if (g_iLoadedMask[id] == 15)
+			Test_bps_players(id)
+	}
+	else
+	{
+		ScheduleLoadRetry(id)
 	}
 }
 
 public RegisterClient4( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
 {
-	new id
-	id = Data[ 0 ]
-	new SQL_TABLE4[256]
-	
-	g_szPoints_2k[id] = 0
-	g_szPoints_3k[id] = 0
-	g_szPoints_4k[id] = 0
-	g_szPoints_5k[id] = 0
-	g_szPoints_v1[id] = 0
-	g_szPoints_v2[id] = 0
-	g_szPoints_v3[id] = 0
-	g_szPoints_v4[id] = 0
-	g_szPoints_v5[id] = 0
-	
-	get_cvar_string("bps_sql_db_4",SQL_TABLE4,256)
+	new id = Data[ 0 ]
+	if (!is_user_connected(id) || get_user_userid(id) != Data[ 1 ] || g_iLoadSeq[id] != Data[ 2 ])
+		return
+
 	if( !SQL_IsFail( FailState, Errcode, Error ) )
 	{
 		if( SQL_NumResults( Query ) < 1 )
 		{
-			new szTemp[ 512 ]
-			format( szTemp, charsmax( szTemp ), "INSERT INTO %s \
-			(authid, nick, pug_2k, pug_3k, pug_4k, pug_5k, pug_v1, pug_v2, pug_v3, pug_v4, pug_v5 ) \
-			VALUES( '%s', '%s', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i', '%i' )", 
-			SQL_TABLE4, g_szAuthID[id], g_szName[id], 
-			g_szPoints_2k[id], 
-			g_szPoints_3k[id], 
-			g_szPoints_4k[id], 
-			g_szPoints_5k[id], 
-			g_szPoints_v1[id], 
-			g_szPoints_v2[id], 
-			g_szPoints_v3[id], 
-			g_szPoints_v4[id], 
-			g_szPoints_v5[id] )
+			arrayset(g_iVersus[id], 0, eVersusStats)
+			arrayset(g_iVersusSynced[id], 0, eVersusStats)
+
+			static szTemp[ 1024 ]
+			formatex( szTemp, charsmax( szTemp ), "INSERT INTO %s \
+			(server_id, save_key, authid, nick, pug_2k, pug_3k, pug_4k, pug_5k, pug_v1, pug_v2, pug_v3, pug_v4, pug_v5 ) \
+			VALUES( '%s', '%s', '%s', '%s', 0, 0, 0, 0, 0, 0, 0, 0, 0 ) \
+			ON DUPLICATE KEY UPDATE authid = VALUES(authid), nick = VALUES(nick)",
+			SQL_TABLE4, g_szEffectiveServerID, g_szSaveKey[id], g_szAuthID[id], g_szName[id] )
 			SQL_ThreadQuery( g_SqlTuple, "IgnoreHandle", szTemp )
 		}
 		else
 		{
-			g_szPoints_2k[id] = SQL_ReadResult( Query, 0 )
-			g_szPoints_3k[id] = SQL_ReadResult( Query, 1 )
-			g_szPoints_4k[id] = SQL_ReadResult( Query, 2 )
-			g_szPoints_5k[id] = SQL_ReadResult( Query, 3 )
-			g_szPoints_v1[id] = SQL_ReadResult( Query, 4 )
-			g_szPoints_v2[id] = SQL_ReadResult( Query, 5 )
-			g_szPoints_v3[id] = SQL_ReadResult( Query, 6 )
-			g_szPoints_v4[id] = SQL_ReadResult( Query, 7 )
-			g_szPoints_v5[id] = SQL_ReadResult( Query, 8 )
+			for (new i = 0; i < eVersusStats; i++)
+			{
+				g_iVersus[id][i] = SQL_ReadResult(Query, i)
+				g_iVersusSynced[id][i] = g_iVersus[id][i]
+			}
+		}
+
+		g_iLoadedMask[id] |= (1 << 3)
+		if (g_iLoadedMask[id] == 15)
+			Test_bps_players(id)
+	}
+	else
+	{
+		ScheduleLoadRetry(id)
+	}
+}
+
+public Test_bps_players(id)
+{
+	if (!is_user_connected(id) || !IsStatsActive() || g_iLoadedMask[id] != 15)
+		return
+
+	if (!IsMatchTrackingActive())
+	{
+		bps_players[id] = 15
+		return
+	}
+
+	new CsTeams:team = SafeGetUserTeam(id)
+	if (team == CS_TEAM_T || team == CS_TEAM_CT)
+	{
+		if (bps_players[id] != 1)
+		{
+			bps_players[id] = 1
+			g_bPlayedActiveMatch[id] = true
+			if (!is_user_bot(id))
+				client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_SET_ID_1")
 		}
 	}
-	Test_bps_players(id)
+	else
+	{
+		bps_players[id] = 15
+		if (!is_user_bot(id))
+			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_JOIN_S")
+	}
 }
 
 public IgnoreHandle( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
 {
-	SQL_FreeHandle( Query )
+	SQL_IsFail( FailState, Errcode, Error )
 }
 
 public stats_pug(id)
@@ -1582,125 +2890,62 @@ public stats_pug(id)
 	static Text[190]
 	read_args(Text, charsmax(Text))
 	remove_quotes(Text)
-	
-	if(equali(Text, ".stats"))
-	{
-		if(bps_players[id] == 1)
-		{
-			SkillRank(id)
-			return PLUGIN_CONTINUE
-		}
-		if(bps_players[id] == 15)
-		{
-			client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_DESACT_ID_15")
-			return PLUGIN_CONTINUE
-		}
-	}
-	if(equali(Text, ".top"))
-	{
-		pug_stats_top(id)
-		return PLUGIN_CONTINUE
-	}
-	if(equali(Text, ".top15"))
-	{
-		pug_stats_top(id)
-		return PLUGIN_CONTINUE
-	}
-	return PLUGIN_CONTINUE
-}
+	trim(Text)
 
-public pug_stats_temp(id)
-{
-	new web_temp_pug_stats[256]
-	get_cvar_string("pug_web_temp_pug",web_temp_pug_stats,256)
-	if( get_pcvar_num( pcvarToggle_stats ) == 0 )
-	{
-		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, LANG_PLAYER, "BPS_STATS_PUG")
+	if (!equali(Text, ".top"))
 		return PLUGIN_CONTINUE
-	}
-	if( get_pcvar_num( pcvarToggle_stats ) == 1 )
+
+	new Float:flNow = get_gametime()
+	if (flNow - g_flLastStatsCmd[id] < 5.0)
 	{
-		show_motd(id, web_temp_pug_stats, "BASIC POINTS STATS")
-		return PLUGIN_CONTINUE
+		client_print_color(id, print_team_default, "^4%s ^1%L", pug_panama, id, "BPS_STATS")
+		return PLUGIN_HANDLED
 	}
+	g_flLastStatsCmd[id] = flNow
+
+	pug_stats_top(id)
 	return PLUGIN_HANDLED
 }
 
 public pug_stats_top(id)
 {
-	new web_top_pug_stats[256]
-	get_cvar_string("pug_web_top_pug",web_top_pug_stats,256)
-	
-	show_motd(id, web_top_pug_stats, "BASIC POINTS STATS")
-	
+	static szWebUrl[256], szTitle[64]
+	BuildMotdTopUrl(id, szWebUrl, charsmax(szWebUrl))
+	formatex(szTitle, charsmax(szTitle), "%L", id, "BPS_MOTD_TITLE")
+
+	show_motd(id, szWebUrl, szTitle)
 	return PLUGIN_HANDLED
 }
 
-public motd_pug_end()
+public motd_pug_end(id, level, cid)
 {
-	new web_temp_pug_stats[256]
-	get_cvar_string("pug_web_temp_pug",web_temp_pug_stats,256)
-	show_motd(0, web_temp_pug_stats, "BASIC POINTS STATS")
+	if (!cmd_access(id, level, cid, 1))
+		return PLUGIN_HANDLED
+
+	static szWebUrl[256], szTitle[64]
+	BuildMotdTopUrl(0, szWebUrl, charsmax(szWebUrl))
+	formatex(szTitle, charsmax(szTitle), "%L", LANG_SERVER, "BPS_MOTD_TITLE")
+
+	show_motd(0, szWebUrl, szTitle)
 	return PLUGIN_HANDLED
 }
 
-public SkillRank( id )
+stock bool:SQL_IsFail( FailState, Errcode, const Error[ ] )
 {
-	new SQL_TABLE1[256]
-	get_cvar_string("bps_sql_db_1",SQL_TABLE1,256)
-	
-	new Data[ 1 ]
-	Data[ 0 ] = id
-	
-	new szTemp[ 512 ]
-	format( szTemp, charsmax( szTemp ), "SELECT COUNT(*) FROM %s WHERE pug_k >= %i", SQL_TABLE1, g_szPoints_k[ id ])
-	SQL_ThreadQuery( g_SqlTuple, "GetTotalRows", szTemp, Data, 1 )
-	
-	return PLUGIN_CONTINUE
-}
-
-public GetTotalRows( FailState, Handle:Query, Error[ ], Errcode, Data[ ], DataSize )
-{
-	new id
-	id = Data[ 0 ]
-	
-	if( !SQL_IsFail( FailState, Errcode, Error ) )
-	{
-		static szName[32], Info[1501], len; 
-		get_user_name(id, szName, charsmax(szName))
-		len = format(Info, 1500,"<body bgcolor=#FFFFFF><font color=#FFFFFF><pre>");
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>Player:</B><font color=^"#000000^">%s</color></left>^n", szName);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>Frags:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_k[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>Death:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_d[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>Assists:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_a[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>Bomb plant:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_bp[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>Bomb Defuse:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_bd[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>2K:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_2k[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>3K:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_3k[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>4K:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_4k[id]);
-		len += format(Info[len], 1500-len,"<left><font color=^"#000000^"><B>5K:</B><font color=^"#000000^">%i</color></left>^n", g_szPoints_5k[id]);
-		show_motd(id, Info, "BASIC POINTS STATS");
-	}
-}
-
-SQL_IsFail( FailState, Errcode, Error[ ] ) {
 	if( FailState == TQUERY_CONNECT_FAILED )
 	{
-		log_amx( "[Error] Could not connect to SQL database: %s", Error )
+		log_amx( "%L: %s", LANG_SERVER, "BPS_LOG_SQL_CONNECT_ERR", Error )
 		return true
 	}
 	if( FailState == TQUERY_QUERY_FAILED )
 	{
-		log_amx( "[Error] Query failed: %s", Error )
+		log_amx( "%L: %s", LANG_SERVER, "BPS_LOG_SQL_QUERY_ERR", Error )
 		return true
 	}
 	if( Errcode )
 	{
-		log_amx( "[Error] Error on query: %s", Error )
+		log_amx( "%L: %s", LANG_SERVER, "BPS_LOG_SQL_EXEC_ERR", Error )
 		return true
 	}
 	return false
 }
-/* AMXX-Studio Notes - DO NOT MODIFY BELOW HERE
-*{\\ rtf1\\ ansi\\ deff0{\\ fonttbl{\\ f0\\ fnil Tahoma;}}\n\\ viewkind4\\ uc1\\ pard\\ lang2070\\ f0\\ fs16 \n\\ par }
-*/

@@ -3,6 +3,4 @@
 #endif
 #define _basicstatsconnect_included
 
-stock PREFIXTEX[] = "---->"
-stock pug_panama[] = "[BPS]"
-stock pug_panagamers[] = "[ShowScore]"
+stock const pug_panama[] = "[BPS]"
